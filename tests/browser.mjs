@@ -67,11 +67,10 @@ async function drive(chrome, url, width, timeoutMs) {
     const ws = new WebSocket(targets.find(t => t.type === 'page').webSocketDebuggerUrl)
     await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject })
     let id = 0
-    const pending = new Map()
-    ws.onmessage = e => { const m = JSON.parse(e.data); pending.get(m.id)?.(m); pending.delete(m.id) }
     const read = () => new Promise(resolve => {
-      pending.set(++id, resolve)
-      ws.send(JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression: 'window.__result', returnByValue: true } }))
+      const sent = ++id
+      ws.onmessage = e => { const m = JSON.parse(e.data); if (m.id === sent) resolve(m) }
+      ws.send(JSON.stringify({ id: sent, method: 'Runtime.evaluate', params: { expression: 'window.__result', returnByValue: true } }))
     })
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {

@@ -6,7 +6,8 @@ export type SniffedFormat =
   | 'unknown'
 
 // SVG is markup, not a binary signature: a URL without an .svg extension still serves it
-const SVG_START = /^\s*(?:<\?xml[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*(?:<!DOCTYPE[^>]*>\s*)?<svg[\s>]/i
+// comment bodies exclude "-->" so a run of comments can't backtrack exponentially (ReDoS)
+const SVG_START = /^\s*(?:<\?xml[^>]*>\s*)?(?:<!--(?:[^-]|-(?!->))*-->\s*)*(?:<!DOCTYPE[^>]*>\s*)?<svg[\s>]/i
 
 export function sniffFormat(b: Uint8Array): SniffedFormat {
   if (b.length >= 2 && b[0] === 0xFF && b[1] === 0xD8) return 'jpeg'

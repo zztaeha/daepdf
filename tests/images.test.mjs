@@ -56,6 +56,13 @@ export default async function ({ test, eq, ok, load }) {
     eq(svg('<svg xmlns="http://www.w3.org/2000/svg"></svg>'), 'svg')
     eq(svg('\uFEFF<?xml version="1.0"?>\n<!-- icon -->\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x">\n<svg>'), 'svg')
     eq(svg('<html><svg></svg></html>'), 'unknown')
+    eq(svg('<!-- a -- b ---><!---->\n<svg>'), 'svg')
+  })
+
+  test('a run of SVG comments does not backtrack exponentially', () => {
+    const started = Date.now()
+    eq(sniff.sniffFormat(new Uint8Array(Buffer.from('<!--' + '--><!--'.repeat(28) + 'x'))), 'unknown')
+    ok(Date.now() - started < 1000, 'sniffFormat returned promptly')
   })
 
   test('sniffFormat does not mistake arbitrary data for avif', () => {
