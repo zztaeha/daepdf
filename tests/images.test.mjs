@@ -31,7 +31,7 @@ export default async function ({ test, eq, ok, load }) {
 
   test('the fast path really does decode a palette PNG', () => {
     const p = parseImage(new Uint8Array(palettePng))
-    ok(p !== null, 'parseImage handles colour type 3')
+    ok(p !== null, 'parseImage handles color type 3')
     eq([...p.data].join(','), '255,0,0,0,255,0,0,0,255')
   })
 
@@ -39,7 +39,7 @@ export default async function ({ test, eq, ok, load }) {
     const needsBrowser = sniff.pngNeedsBrowserDecode(new Uint8Array(palettePng))
     const fastPathHandles = parseImage(new Uint8Array(palettePng)) !== null
     ok(!(needsBrowser && fastPathHandles),
-      'pngNeedsBrowserDecode sends colour type 3 to the browser even though parseImage decodes it')
+      'pngNeedsBrowserDecode sends color type 3 to the browser even though parseImage decodes it')
   })
 
   test('sniffFormat identifies the common formats', () => {
@@ -49,6 +49,13 @@ export default async function ({ test, eq, ok, load }) {
     eq(sniff.sniffFormat(new Uint8Array([0x42,0x4D])), 'bmp')
     eq(sniff.sniffFormat(new Uint8Array(Buffer.from('RIFF____WEBP', 'ascii'))), 'webp')
     eq(sniff.sniffFormat(new Uint8Array([1,2,3])), 'unknown')
+  })
+
+  test('sniffFormat recognizes SVG markup with or without a prolog', () => {
+    const svg = s => sniff.sniffFormat(new Uint8Array(Buffer.from(s)))
+    eq(svg('<svg xmlns="http://www.w3.org/2000/svg"></svg>'), 'svg')
+    eq(svg('\uFEFF<?xml version="1.0"?>\n<!-- icon -->\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x">\n<svg>'), 'svg')
+    eq(svg('<html><svg></svg></html>'), 'unknown')
   })
 
   test('sniffFormat does not mistake arbitrary data for avif', () => {
@@ -67,5 +74,40 @@ export default async function ({ test, eq, ok, load }) {
     sniff.pngNeedsBrowserDecode(new Uint8Array(t))
     parseImage(new Uint8Array(t))
     ok(Date.now() - started < 1000, 'walker returned promptly')
+  })
+
+  // a stand-in ICC profile: only the header fields the parser checks (size, data color space)
+  const profile = space => { const b = Buffer.alloc(200, 7); b.writeUInt32BE(200, 0); b.write(space, 16, 'ascii'); return b }
+  // JPEG markers up to SOF0, the profile split over two APP2 segments
+  const app2 = (seq, count, data) => {
+    const body = Buffer.concat([Buffer.from('ICC_PROFILE\0', 'ascii'), Buffer.from([seq, count]), data])
+    const len = Buffer.alloc(2); len.writeUInt16BE(body.length + 2)
+    return Buffer.concat([Buffer.from([0xFF, 0xE2]), len, body])
+  }
+  const sof = Buffer.from([0xFF, 0xC0, 0, 17, 8, 0, 4, 0, 4, 3, 1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1])
+  const jpegWith = icc => new Uint8Array(Buffer.concat([Buffer.from([0xFF, 0xD8]), app2(2, 2, icc.subarray(100)), app2(1, 2, icc.subarray(0, 100)), sof]))
+
+  test('a JPEG\'s ICC profile is reassembled from its APP2 segments', () => {
+    const p = parseImage(jpegWith(profile('RGB ')))
+    eq(Buffer.from(p.icc).equals(profile('RGB ')), true)
+    ok(parseImage(jpegWith(profile('CMYK'))).icc === null, 'a profile for other channels is ignored')
+  })
+
+  test('a PNG\'s iCCP profile is read', () => {
+    const png = Buffer.concat([SIG, ihdr(1, 1, 8, 2),
+      chunk('iCCP', Buffer.concat([Buffer.from('P3\0\0', 'binary'), zlib.deflateSync(profile('RGB '))])),
+      chunk('IDAT', zlib.deflateSync(rows(1, 1, 3, () => 100))), chunk('IEND', Buffer.alloc(0))])
+    eq(Buffer.from(parseImage(new Uint8Array(png)).icc).equals(profile('RGB ')), true)
+  })
+
+  test('an embedded profile becomes the image\'s ICCBased color space, written once', async () => {
+    const { PdfDoc } = await load('tests/_entry.ts')
+    const d = new PdfDoc(200, 200)
+    const jpeg = jpegWith(profile('RGB '))
+    for (const y of [0, 50]) d.draw_image(d.embed_image(jpeg), 0, y, 40, 40)
+    d.draw_image(d.embed_image(jpegWith(profile('RGB '))), 100, 0, 40, 40)
+    const out = Buffer.from(d.output()).toString('latin1')
+    eq((out.match(/\/ColorSpace \[\/ICCBased \d+ 0 R\]/g) ?? []).length, 3)
+    eq((out.match(/\/N 3\s*\/Alternate \/DeviceRGB/g) ?? []).length, 1)
   })
 }

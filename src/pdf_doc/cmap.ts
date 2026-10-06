@@ -15,20 +15,16 @@ export function toUnicodeCmap(glyphToUnicode: Map<number, number[]>): string {
     const sg = codes[i]!
     const sc = single(sg)
     let end = i
-    // A bfrange with a single destination increments that string's LAST BYTE,
-    // so one may not span more than 256 codes. Nothing real has come close –
-    // the longest consecutive glyph/codepoint run measured across four fonts
-    // was 85 – but a large CJK font could, and the overflow would be silent.
-    const MAX_BFRANGE_SPAN = 256
-    // sc is the run's starting codepoint and cannot change while the run grows,
-    // so the two conditions on it are settled before the loop rather than re-read
+    // a bfrange's source codes differ only in their last byte and its destination increments
+    // only its last byte, so a run stops where the glyph id or the codepoint would carry
     const startCompressible = sc !== null && sc <= 0xFFFF
     if (startCompressible) {
-      while (end + 1 < codes.length && end - i + 1 < MAX_BFRANGE_SPAN) {
+      while (end + 1 < codes.length) {
         const ng = codes[end + 1]!
         const nc = single(ng)
         const ec = single(codes[end]!)
         if (nc === null || ec === null || ng !== codes[end]! + 1 || nc !== ec + 1 || ec >= 0xFFFF) break
+        if ((ng & 0xFF) === 0 || (nc & 0xFF) === 0) break
         end++
       }
     }

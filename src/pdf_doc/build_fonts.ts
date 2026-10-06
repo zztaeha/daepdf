@@ -1,30 +1,86 @@
 import type { InternalCtx, DocFont } from './types.js'
 import { toPdfName, bboxToPdf, widthsToPdf, w2ToPdf, _te } from './utils.js'
 import { toUnicodeCmap } from './cmap.js'
-import type { SubsetFontResult } from '../types/index.js'
 import {
   get_advance_widths, get_vertical_advance, subset_font_full,
-} from '../daepl/wasm/daepl.js'
+} from '../daegun/wasm/daegun.js'
 import { deflate } from './deflate.js'
+
+// A subset's PostScript name starts with six uppercase letters and a plus (ISO 32000-1
+// 9.6.4); derived from the font's id and glyphs, so each subset gets its own name
+function subsetTag(id: string, gids: Uint16Array): string {
+  let h = 0x811C9DC5
+  for (const c of id) h = Math.imul(h ^ c.charCodeAt(0), 0x01000193)
+  for (const g of gids) h = Math.imul(h ^ g, 0x01000193)
+  let tag = ''
+  for (let i = 0; i < 6; i++) { tag += String.fromCharCode(65 + (h >>> 0) % 26); h = Math.imul(h ^ i, 0x01000193) }
+  return tag
+}
+
+// What a PDF reads from an embedded font (ISO 32000-1 9.9), plus what OpenType requires of a CFF
+// font; layout, color and bitmap tables are dead weight there (an emoji font's sbix runs past 100MB)
+const TRUETYPE_TABLES: ReadonlySet<string> = new Set(['head', 'hhea', 'hmtx', 'maxp', 'loca', 'glyf', 'cvt ', 'fpgm', 'prep', 'gasp', 'OS/2', 'post', 'vhea', 'vmtx'])
+const CFF_TABLES: ReadonlySet<string> = new Set(['head', 'hhea', 'hmtx', 'maxp', 'CFF ', 'cmap', 'name', 'OS/2', 'post', 'vhea', 'vmtx', 'VORG'])
+
+const isSfnt = (b: Uint8Array): boolean => b.length > 12 &&
+  ((b[0] === 0 && b[1] === 1 && b[2] === 0 && b[3] === 0) || sfntTag(b, 0) === 'OTTO' || sfntTag(b, 0) === 'true')
+const sfntTag = (b: Uint8Array, o: number): string => String.fromCharCode(b[o]!, b[o + 1]!, b[o + 2]!, b[o + 3]!)
+
+// The font with only the given tables: the directory and data rewritten, head's checksum
+// adjustment recomputed over the result
+export function onlyTables(font: Uint8Array, keep: ReadonlySet<string>): Uint8Array {
+  if (!isSfnt(font)) return font
+  const view = new DataView(font.buffer, font.byteOffset, font.byteLength)
+  const tables = Array.from({ length: view.getUint16(4) }, (_, i) => {
+    const o = 12 + i * 16
+    return { tag: sfntTag(font, o), record: o, offset: view.getUint32(o + 8), length: view.getUint32(o + 12) }
+  })
+  const kept = tables.filter(t => keep.has(t.tag))
+  if (kept.length === tables.length) return font
+
+  const n = kept.length, pow = 2 ** Math.floor(Math.log2(n))
+  const out = new Uint8Array(12 + n * 16 + kept.reduce((sum, t) => sum + ((t.length + 3) & ~3), 0))
+  const ov = new DataView(out.buffer)
+  ov.setUint32(0, view.getUint32(0))
+  ov.setUint16(4, n); ov.setUint16(6, pow * 16); ov.setUint16(8, Math.log2(pow)); ov.setUint16(10, n * 16 - pow * 16)
+  let at = 12 + n * 16, headAt = -1
+  kept.forEach((t, i) => {
+    out.set(font.subarray(t.record, t.record + 8), 12 + i * 16)
+    ov.setUint32(12 + i * 16 + 8, at)
+    ov.setUint32(12 + i * 16 + 12, t.length)
+    out.set(font.subarray(t.offset, t.offset + t.length), at)
+    if (t.tag === 'head') headAt = at
+    at += (t.length + 3) & ~3
+  })
+  if (headAt >= 0 && headAt + 12 <= out.length) {
+    ov.setUint32(headAt + 8, 0)
+    let sum = 0
+    for (let o = 0; o + 4 <= out.length; o += 4) sum = (sum + ov.getUint32(o)) >>> 0
+    ov.setUint32(headAt + 8, (0xB1B0AFBA - sum) >>> 0)
+  }
+  return out
+}
 
 function embedFont(ctx: InternalCtx, font: DocFont): void {
   const gids   = new Uint16Array([...font.glyphIds].sort((a, b) => a - b))
-  const result = subset_font_full(font.fontName, font.style, font.weight, font.opsz, gids) as SubsetFontResult | null
+  const result = subset_font_full(font.fontName, font.style, font.weight, font.opsz, gids)
 
   if (!result) return
-  const { fontBytes, glyphMap, isCff, ascender, descender, capHeight, bbox, flags, italicAngle, fontName } = result
+  const { glyphMap, isCff, ascender, descender, capHeight, bbox, flags, italicAngle } = result
+  const fontName = `${subsetTag(font.id, gids)}+${result.fontName}`
 
-  if (!fontBytes) return
+  const fontBytes = onlyTables(result.fontBytes, isCff ? CFF_TABLES : TRUETYPE_TABLES)
 
-  const rawAdvs  = get_advance_widths(font.fontName, font.style, font.weight, font.opsz, gids) as Float64Array
+  const rawAdvs  = get_advance_widths(font.fontName, font.style, font.weight, font.opsz, gids)
   const widths: [number, number][] = Array.from(gids, (gid, i) => [gid, Math.round(rawAdvs[i]!)] as [number, number])
 
   const fontTableId = ctx.newObject()
-  const compFont    = deflate(fontBytes) as Uint8Array
+  const compFont    = deflate(fontBytes)
   ctx.out('<<')
   ctx.out(`/Length ${ctx.encryptedLength(compFont.length)}`)
   if (isCff) {
-    ctx.out('/Subtype /CIDFontType0C')
+    // a CFF-flavored OpenType file is labeled as one; a bare CFF table as CIDFontType0C
+    ctx.out(`/Subtype /${sfntTag(fontBytes, 0) === 'OTTO' ? 'OpenType' : 'CIDFontType0C'}`)
   } else {
     ctx.out(`/Length1 ${fontBytes.length}`)
   }
@@ -35,8 +91,11 @@ function embedFont(ctx: InternalCtx, font: DocFont): void {
   ctx.out('endstream')
   ctx.out('endobj')
 
-  const cmapText = toUnicodeCmap(font.glyphToUnicode)
-  const compCmap = deflate(_te.encode(cmapText)) as Uint8Array
+  // every missing character shares .notdef, so mapping it would copy them all as the first one
+  const unicode = new Map(font.glyphToUnicode)
+  unicode.delete(0)
+  const cmapText = toUnicodeCmap(unicode)
+  const compCmap = deflate(_te.encode(cmapText))
   const cmapId   = ctx.newObject()
   ctx.out('<<')
   ctx.out(`/Length ${ctx.encryptedLength(compCmap.length)}`)
@@ -51,13 +110,12 @@ function embedFont(ctx: InternalCtx, font: DocFont): void {
   if (!isCff) {
     const maxCid   = gids.length ? Math.max(...gids) : 0
     const mapBytes = new Uint8Array((maxCid + 1) * 2)
-    const gm       = glyphMap as Uint16Array
     for (const orig of gids) {
-      const compact = (orig < gm.length ? gm[orig]! : 0)
+      const compact = (orig < glyphMap.length ? glyphMap[orig]! : 0)
       mapBytes[orig * 2]     = (compact >> 8) & 0xFF
       mapBytes[orig * 2 + 1] =  compact       & 0xFF
     }
-    const compMap = deflate(mapBytes) as Uint8Array
+    const compMap = deflate(mapBytes)
     cidToGidId    = ctx.newObject()
     ctx.out('<<')
     ctx.out(`/Length ${ctx.encryptedLength(compMap.length)}`)
@@ -113,8 +171,7 @@ function embedFont(ctx: InternalCtx, font: DocFont): void {
   ctx.out('>>')
   const type0Id = ctx.queueForObjStm(ctx.endCapture())
 
-  font.objectNumber    = type0Id
-  font.isAlreadyPutted = true
+  font.objectNumber = type0Id
 
   // A4 (vertical writing modes): a second, parallel Type0/CIDFont dict pair,
   // built only when this font was actually used vertically — same embedded
@@ -188,9 +245,6 @@ function stemV(weight: number): number {
 
 export function putFonts(ctx: InternalCtx): void {
   for (const font of ctx.fonts) {
-    if (!ctx.usedFonts.has(font.id)) continue
-    if (font.isAlreadyPutted) continue
-    if (font.glyphIds.size <= 1) continue
-    embedFont(ctx, font)
+    if (ctx.usedFonts.has(font.id)) embedFont(ctx, font)
   }
 }

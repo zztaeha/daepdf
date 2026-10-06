@@ -18,10 +18,6 @@ export interface RawImage {
 // (~3x the file size) instead of 1.
 const _decodeCache = new Map<Uint8Array, Promise<RawImage | null>>()
 
-export function clearDecodeCache(): void {
-  _decodeCache.clear()
-}
-
 // browser-decode any format the engine doesn't handle natively straight to
 // raw pixels for embedding — no PNG re-encode round trip
 export function decodeToRaw(bytes: Uint8Array): Promise<RawImage | null> {
@@ -36,8 +32,9 @@ async function decodeToRawUncached(bytes: Uint8Array): Promise<RawImage | null> 
     const blob = new Blob([bytes as unknown as ArrayBuffer])
     let bmp: ImageBitmap
     try {
-      // unpremultiplied, unmanaged pixels where the browser honors it
-      bmp = await createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' })
+      // unpremultiplied, and converted to sRGB as the browser shows it: the PDF embeds
+      // these as DeviceRGB, so a P3-tagged image's raw values would print off-color
+      bmp = await createImageBitmap(blob, { premultiplyAlpha: 'none' })
     } catch {
       bmp = await createImageBitmap(blob)
     }

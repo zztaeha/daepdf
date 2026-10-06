@@ -2,17 +2,11 @@ import { loadAndRegisterFont } from '../../engine.js'
 import { PX_PER_PT } from './types.js'
 import { invalidateFontMapCache } from './fonts.js'
 
-export async function waitForLayout(): Promise<void> {
-  if (typeof document !== 'undefined' && document.fonts?.ready) {
-    await document.fonts.ready
-  }
-  await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
-}
-
 // call this only once the node is attached to a live, styled document — getComputedStyle
 // can't resolve stylesheet-cascaded values on a detached DOMParser document, only inline
 // styles, so this must run after safeInjectParsed(), not inside parseSafeHTML()
-export function injectWordBreaks(root: Node, chunkSize = 25): void {
+export function injectWordBreaks(root: Node): void {
+  const chunkSize = 25
   const d      = root.ownerDocument ?? document
   const walker = d.createTreeWalker(root, NodeFilter.SHOW_TEXT)
   const targets: Text[] = []
@@ -20,7 +14,7 @@ export function injectWordBreaks(root: Node, chunkSize = 25): void {
   while ((node = walker.nextNode())) targets.push(node as Text)
 
   for (const text of targets) {
-    const raw = text.textContent ?? ''
+    const raw = text.textContent
     if (!/\S{26,}/.test(raw)) continue
     const parent = text.parentNode
     if (!parent) continue
@@ -46,17 +40,8 @@ export function injectWordBreaks(root: Node, chunkSize = 25): void {
   }
 }
 
-// Each render()/preview() call needs its OWN scope-root marker value, not a shared
-// constant — a live preview's container stays attached in the DOM (by design, so the
-// page doesn't flash between renders) for as long as it takes the NEXT preview to
-// replace it, which overlaps with any render() call made in the meantime (e.g. a host
-// app exporting a PDF while its own preview is still showing). Two containers alive at
-// once that both matched the SAME generic `[data-tpdf-scope]` selector let their
-// `@scope` blocks cross-apply to each other's elements for any property the later
-// one didn't redeclare — confirmed by direct reproduction: a render() call picked up
-// a border from an unrelated, already-completed preview() call's stylesheet, for two
-// templates that only happened to reuse the same class name. A per-call unique id
-// closes this off structurally, regardless of the exact engine mechanism at fault.
+// Per-call @scope root marker, so a template's CSS only ever matches its own container,
+// even with several containers alive in one document.
 let scopeCounter = 0
 export function nextScopeId(): string {
   scopeCounter += 1
@@ -80,25 +65,30 @@ function scopeTemplateCSS(css: string, scopeId: string): string {
   return [faces.join('\n'), scoped].filter(Boolean).join('\n')
 }
 
+const SVG_NS = 'http://www.w3.org/2000/svg'
+
 // DOMParser strips script/event-handler injection without executing anything
 export function parseSafeHTML(html: string, scopeId: string): Document {
   const doc = new DOMParser().parseFromString(html, 'text/html')
   // an externally-linked stylesheet silently vanishing is an easy mistake to make
   // (inline <style> blocks work fine) — warn instead of dropping it with no trace
   doc.querySelectorAll('link[rel="stylesheet"]').forEach(l => {
-    console.warn(`[daepdf] <link rel="stylesheet" href="${l.getAttribute('href')}"> is not supported and was removed — use an inline <style> block instead.`)
+    console.warn(`[daepdf] <link rel="stylesheet" href="${l.getAttribute('href')}"> is not supported and was removed – use an inline <style> block instead.`)
   })
   doc.querySelectorAll('script, link, object, embed, iframe, video, audio').forEach(s => s.remove())
   doc.querySelectorAll('style').forEach(s => {
-    const css = s.textContent ?? ''
+    const css = s.textContent
     for (const imp of css.match(/@import\b[^;]*/g) ?? []) {
-      console.warn(`[daepdf] "${imp.trim()}" is not supported and was removed — inline the imported stylesheet's contents instead.`)
+      console.warn(`[daepdf] "${imp.trim()}" is not supported and was removed – inline the imported stylesheet's contents instead.`)
     }
     s.textContent = scopeTemplateCSS(css.replace(/@import\b[^;]*;?/g, ''), scopeId)
   })
   const XLINK_NS = 'http://www.w3.org/1999/xlink'
-  const isScriptScheme = (v: string | null): boolean => !!v && /^\s*(javascript|data|vbscript):/i.test(v)
   doc.querySelectorAll('*').forEach(el => {
+    // an SVG image only displays its source, so an embedded data: image stays
+    const allowData = el.namespaceURI === SVG_NS && (el.localName === 'image' || el.localName === 'feImage')
+    const isScriptScheme = (v: string | null): boolean =>
+      !!v && (/^\s*(javascript|vbscript):/i.test(v) || (!allowData && /^\s*data:/i.test(v)))
     for (const { name } of Array.from(el.attributes)) {
       if (name.startsWith('on')) el.removeAttribute(name)
     }
@@ -121,46 +111,25 @@ export function safeInjectParsed(doc: Document, container: HTMLElement, scopeId:
   // SAME id passed to parseSafeHTML for this same html, or the CSS's embedded
   // @scope selector never matches this container at all
   container.dataset['tpdfScope'] = scopeId
-  const frag = document.createDocumentFragment()
+  const target = container.ownerDocument
+  const frag = target.createDocumentFragment()
   for (const style of Array.from(doc.head.querySelectorAll('style'))) {
-    frag.appendChild(document.importNode(style, true))
+    frag.appendChild(target.importNode(style, true))
   }
   for (const node of Array.from(doc.body.childNodes)) {
-    frag.appendChild(document.importNode(node, true))
+    frag.appendChild(target.importNode(node, true))
   }
   container.textContent = ''
   container.appendChild(frag)
 }
 
-// pageHPt (the true single-page height) is optional and defaults to auto —
-// chrome.ts's own header/footer measurement container has no single "page"
-// height of its own to give (and doesn't need one: nested position:fixed
-// content there never reaches captureFixedElement's special handling in the
-// first place, since ctx.fixedElements is unset for that capture — see
-// walk.ts). fromHTML's real per-document container DOES pass it, which is
-// what actually matters: without an explicit height, a bottom/right-anchored
-// position:fixed element resolves its offset against however tall the
-// ACTUAL (often much-shorter-than-a-page) content is, not the true page
-// height previewHTML's own page-card divs correctly use — landing far too
-// high/left on export while looking right in the live preview. Confirmed via
-// a real user report (a bottom-right image exported to the top-right) and by
-// directly verifying overflow:visible + an explicit height does NOT affect
-// scrollHeight (still reports the full, true content height including
-// anything visually overflowing past it) — so fromDOM's own pagination math
-// stays exactly as accurate as before this fix.
-export function createHiddenContainer(pageWPt: number, pageHPt?: number): HTMLDivElement {
-  const div = document.createElement('div')
-  // transform:translateZ(0) is a zero-distance, purely-cosmetic-free translate —
-  // its only effect is establishing a new containing block for position:fixed
-  // descendants (per spec, only transform/filter/perspective/will-change/contain
-  // do this, NOT position:fixed itself). Without it, a user's own position:fixed
-  // element inside this container escapes to the REAL viewport instead of this
-  // (off-screen, at -99999,-99999) container, landing tens of thousands of
-  // pixels from any real page and silently never rendering at all — confirmed
-  // by direct reproduction, not a hypothetical.
+// Lives in a page frame (frame.ts). translateZ(0) makes it the containing block for position:fixed
+// content, and pageHPt (omitted for header/footer) anchors bottom-fixed elements to the page height.
+export function createHiddenContainer(doc: Document, pageWPt: number, pageHPt?: number): HTMLDivElement {
+  const div = doc.createElement('div')
   const height = pageHPt !== undefined ? `${pageHPt * PX_PER_PT}px` : 'auto'
-  div.style.cssText = `position:fixed;top:-99999px;left:-99999px;width:${pageWPt * PX_PER_PT}px;height:${height};overflow:visible;pointer-events:none;z-index:-9999;transform:translateZ(0);`
-  document.body.appendChild(div)
+  div.style.cssText = `position:absolute;top:0;left:0;width:${pageWPt * PX_PER_PT}px;height:${height};overflow:visible;transform:translateZ(0);`
+  doc.body.appendChild(div)
   return div
 }
 
@@ -204,19 +173,28 @@ export function extractFontFaceBlocks(css: string): string[] {
   return blocks
 }
 
-function parseAtFontFace(html: string): { name: string; url: string }[] {
-  const results: { name: string; url: string }[] = []
+function parseAtFontFace(html: string): { name: string; url: string; block: string }[] {
+  const results: { name: string; url: string; block: string }[] = []
   for (const block of extractFontFaceBlocks(html)) {
     const nameM = block.match(/font-family\s*:\s*['"]?([^'";,]+)['"]?/)
     const urlM  = block.match(/src\s*:[^;]*url\(['"]?([^'")\s]+)['"]?\)/)
-    if (nameM && urlM) results.push({ name: (nameM[1] ?? '').trim(), url: (urlM[1] ?? '').trim() })
+    if (nameM && urlM) results.push({ name: (nameM[1] ?? '').trim(), url: (urlM[1] ?? '').trim(), block })
   }
   return results
 }
 
+// The template's @font-face rules by lowercased family: an SVG drawn as an image can't see the
+// page's fonts, so emitInlineSVG embeds the ones its text uses
+const fontFaceBlocks = new Map<string, Set<string>>()
+export const templateFontFaces = (family: string): string[] => [...fontFaceBlocks.get(family.toLowerCase()) ?? []]
+
 export async function autoRegisterFonts(styleText: string): Promise<void> {
   const faces = parseAtFontFace(styleText)
   if (!faces.length) return
+  for (const f of faces) {
+    const set = fontFaceBlocks.get(f.name.toLowerCase()) ?? new Set()
+    fontFaceBlocks.set(f.name.toLowerCase(), set.add(f.block))
+  }
   await Promise.all(faces.map(f =>
     loadAndRegisterFont({ path: f.url, name: f.name })
       .catch((e) => console.warn(`[daepdf] Could not load font "${f.name}" from ${f.url}:`, e))

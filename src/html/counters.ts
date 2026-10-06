@@ -20,15 +20,23 @@ function parseCounterList(v: string | undefined, def: number): [string, number][
   return out
 }
 
+// One an earlier sibling created is replaced, not nested, as browsers do (CSS Lists 3).
+// True when a new instance was pushed, for the caller to pop at the scope's end.
+function instantiate(counters: CounterMap, name: string, val: number, siblings: readonly string[]): boolean {
+  const st = counters.get(name) ?? []
+  counters.set(name, st)
+  if (siblings.includes(name) && st.length) { st[st.length - 1] = val; return false }
+  st.push(val)
+  return true
+}
+
 // applies an element's (or pseudo's) counter properties; returns the names it
-// pushed new instances for, so the caller can pop them at the right scope end
-export function applyCounters(counters: CounterMap, s: CSSStyleDeclaration): string[] {
+// pushed new instances for, so the caller can pop them at the right scope end.
+// siblings: the names earlier siblings instantiated, still in scope here
+export function applyCounters(counters: CounterMap, s: CSSStyleDeclaration, siblings: readonly string[] = []): string[] {
   const pushed: string[] = []
   const push = (name: string, val: number) => {
-    const st = counters.get(name) ?? []
-    st.push(val)
-    counters.set(name, st)
-    pushed.push(name)
+    if (instantiate(counters, name, val, pushed.includes(name) ? [] : siblings)) pushed.push(name)
   }
 
   for (const [name, val] of parseCounterList(s.counterReset, 0)) push(name, val)
@@ -44,6 +52,21 @@ export function applyCounters(counters: CounterMap, s: CSSStyleDeclaration): str
     else push(name, val)
   }
   return pushed
+}
+
+// The built-in list-item counter, absent from computed styles: lists reset it and items take
+// their ordinal (start, value, reversed), unless the author's CSS manages list-item itself.
+export function applyListItemCounter(
+  counters: CounterMap, el: Element, s: CSSStyleDeclaration, ordinal: () => number, siblings: readonly string[] = [],
+): string[] {
+  const authored = [s.counterReset, (s as any).counterSet, s.counterIncrement].some(v => /(^|\s)list-item(\s|$)/.test(v))
+  if (authored) return []
+  const tag = el.tagName.toUpperCase()
+  if (tag === 'OL' || tag === 'UL' || tag === 'MENU') return instantiate(counters, 'list-item', 0, siblings) ? ['list-item'] : []
+  if (s.display !== 'list-item') return []
+  const st = counters.get('list-item')
+  if (st?.length) { st[st.length - 1] = ordinal(); return [] }
+  return instantiate(counters, 'list-item', ordinal(), siblings) ? ['list-item'] : []
 }
 
 export function popCounters(counters: CounterMap, pushed: string[]): void {
@@ -76,13 +99,20 @@ export function romanNumeral(n: number): string {
   return out
 }
 
-export function alphaLabel(n: number): string {
+const LATIN = [...'abcdefghijklmnopqrstuvwxyz']
+const GREEK = [...'αβγδεζηθικλμνξοπρστυφχψω']
+
+// CSS "alphabetic" counter system: a, b, …, z, aa, ab, …
+function alphabetic(n: number, symbols: string[]): string {
   let rest = countable(n)
   if (rest === null) return ''
   let out = ''
-  while (rest > 0) { rest--; out = String.fromCharCode(97 + (rest % 26)) + out; rest = Math.floor(rest / 26) }
+  while (rest > 0) { rest--; out = symbols[rest % symbols.length]! + out; rest = Math.floor(rest / symbols.length) }
   return out
 }
+
+export const alphaLabel = (n: number): string => alphabetic(n, LATIN)
+const greekLabel = (n: number): string => alphabetic(n, GREEK)
 
 export function counterText(n: number, style?: string): string {
   // '' from the two helpers means "outside what this numbering can express" —
@@ -93,6 +123,8 @@ export function counterText(n: number, style?: string): string {
     case 'lower-latin':          return orDecimal(alphaLabel(n))
     case 'upper-alpha':
     case 'upper-latin':          return orDecimal(alphaLabel(n).toUpperCase())
+    case 'lower-greek':          return orDecimal(greekLabel(n))
+    case 'upper-greek':          return orDecimal(greekLabel(n).toUpperCase())
     case 'lower-roman':          return orDecimal(romanNumeral(n).toLowerCase())
     case 'upper-roman':          return orDecimal(romanNumeral(n))
     case 'decimal-leading-zero': return `${n < 10 && n >= 0 ? '0' : ''}${n}`
@@ -123,9 +155,21 @@ export function resolveContentList(content: string, counters: CounterMap): strin
     }
     const fnM = s.slice(i).match(/^(counters?)\(/)
     if (!fnM) return null
-    const close = s.indexOf(')', i)
+    // the separator is a string, which may itself hold a comma or parenthesis
+    const parts: string[] = []
+    let cur = '', quote: string | null = null, close = -1
+    for (let j = i + fnM[0].length; j < s.length; j++) {
+      const ch = s[j]!
+      if (quote) {
+        cur += ch
+        if (ch === '\\' && j + 1 < s.length) cur += s[++j]
+        else if (ch === quote) quote = null
+      } else if (ch === '"' || ch === "'") { quote = ch; cur += ch }
+      else if (ch === ',') { parts.push(cur.trim()); cur = '' }
+      else if (ch === ')') { parts.push(cur.trim()); close = j; break }
+      else cur += ch
+    }
     if (close < 0) return null
-    const parts = s.slice(i + fnM[0].length, close).split(',').map(p => p.trim())
     const name  = parts[0]
     if (!name) return null
     const stack = counters.get(name)

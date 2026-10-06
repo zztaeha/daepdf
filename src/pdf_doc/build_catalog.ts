@@ -1,5 +1,5 @@
 import type { InternalCtx } from './types.js'
-import { hpf, toPdfName, bytesToHex } from './utils.js'
+import { hpf, toPdfName, bytesToHex, textStringBytes } from './utils.js'
 import { deflate } from './deflate.js'
 import pkg from '../../package.json'
 
@@ -67,7 +67,7 @@ function putOutline(ctx: InternalCtx): number | null {
     const yPdf   = fmtH - bm.y
     const parRef = parent[i] === NO ? `${rootId} 0 R` : `${objIds[parent[i]!]} 0 R`
 
-    ctx.newObjectDeferredBegin(objIds[i]!, true)
+    ctx.newObjectDeferredBegin(objIds[i]!)
     const titleLit = ctx.strLit(bm.title)
     ctx.out('<<')
     ctx.out(`/Title ${titleLit}`)
@@ -86,7 +86,7 @@ function putOutline(ctx: InternalCtx): number | null {
     ctx.out('endobj')
   }
 
-  ctx.newObjectDeferredBegin(rootId, true)
+  ctx.newObjectDeferredBegin(rootId)
   ctx.out('<<')
   ctx.out('/Type /Outlines')
   if (topFirst !== NO) {
@@ -102,26 +102,34 @@ function putOutline(ctx: InternalCtx): number | null {
 export function putCatalog(
   ctx:             InternalCtx,
   structTreeRootId: number | null,
-  pdfaExtras:       { outputIntentId: number; metadataId: number } | null,
+  conformance:      { outputIntentId: number | null; metadataId: number } | null,
 ): number {
   const infoId = ctx.newObject()
   ctx.out('<<')
   ctx.out(`/Producer ${ctx.strLit(`daepdf ${pkg.version}`)}`)
   ctx.out(`/CreationDate ${ctx.strLit(ctx.creationDate)}`)
-  for (const [k, v] of ctx.metadata) ctx.out(`/${toPdfName(k)} ${ctx.strLit(v)}`)
+  // the document language is a catalog entry, not document information
+  for (const [k, v] of ctx.metadata) if (k !== 'Lang') ctx.out(`/${toPdfName(k)} ${ctx.strLit(v)}`)
   ctx.out('>>')
   ctx.out('endobj')
 
   let namesObjId: number | null = null
   if (ctx.namedDests.length) {
     const oid = ctx.newObjectDeferred()
-    const pairs = ctx.namedDests.map(([name, page, y]) => {
+    // a name tree's keys must be sorted, by their bytes as written; readers binary-search them
+    const key = (s: string) => textStringBytes(s)
+    const byKey = (a: Uint8Array, b: Uint8Array) => {
+      for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i]! - b[i]!
+      return a.length - b.length
+    }
+    const sorted = [...ctx.namedDests].sort((a, b) => byKey(key(a[0]), key(b[0])))
+    const pairs = sorted.map(([name, page, y]) => {
       const pg  = Math.min(Math.max(0, page - 1), ctx.pageObjIds.length - 1)
       const ref = ctx.pageObjIds[pg] ?? 0
       const yp  = ctx.formatH - y
       return `${ctx.strLit(name)} [${ref} 0 R /XYZ null ${hpf(yp)} null]`
     })
-    ctx.newObjectDeferredBegin(oid, true)
+    ctx.newObjectDeferredBegin(oid)
     ctx.out('<<')
     ctx.out('/Type /Names')
     ctx.out(`/Names [${pairs.join(' ')}]`)
@@ -152,16 +160,17 @@ export function putCatalog(
     ctx.out('/MarkInfo << /Marked true >>')
     ctx.out(`/StructTreeRoot ${structTreeRootId} 0 R`)
   }
-  // D4: PDF/A wants a document language even when the caller never set
-  // one via metadata.language (applyMetadata already emitted a real /Lang
-  // key into ctx.metadata for that case — this only fires as a fallback)
-  if (ctx.pdfA && !ctx.metadata.some(([k]) => k === 'Lang')) {
-    ctx.out(`/Lang ${ctx.strLit(ctx.pdfaLang ?? 'en-US')}`)
+  // PDF/A and PDF/UA want a document language even when the caller never set one
+  const lang = ctx.metadata.find(([k]) => k === 'Lang')?.[1] ?? (ctx.pdfA || ctx.pdfUA ? ctx.pdfaLang ?? 'en-US' : undefined)
+  if (lang) ctx.out(`/Lang ${ctx.strLit(lang)}`)
+  // AES-256 (R6) is PDF 2.0, or 1.7 with Adobe extension level 8
+  if (ctx.security) ctx.out('/Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >>')
+  if (conformance) {
+    ctx.out(`/Metadata ${conformance.metadataId} 0 R`)
+    if (conformance.outputIntentId !== null) ctx.out(`/OutputIntents [${conformance.outputIntentId} 0 R]`)
   }
-  if (pdfaExtras) {
-    ctx.out(`/Metadata ${pdfaExtras.metadataId} 0 R`)
-    ctx.out(`/OutputIntents [${pdfaExtras.outputIntentId} 0 R]`)
-  }
+  // PDF/UA: viewers show the document's title, not its file name
+  if (ctx.pdfUA) ctx.out('/ViewerPreferences << /DisplayDocTitle true >>')
   // D1 (AcroForm): /DR reuses the SAME resource dict every page already
   // shares (an indirect resource-dictionary reference is spec-legal, PDF
   // 32000-1 Table 218) rather than duplicating font entries into a second
@@ -231,7 +240,7 @@ export function buildXrefStream(ctx: InternalCtx, catalogId: number, encryptId: 
     }
   }
 
-  const comp    = deflate(raw) as Uint8Array
+  const comp    = deflate(raw)
   const idHex   = bytesToHex(ctx.fileId)
   const encPart = encryptId !== null ? `\n/Encrypt ${encryptId} 0 R` : ''
 

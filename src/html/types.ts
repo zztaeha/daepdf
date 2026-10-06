@@ -1,8 +1,6 @@
 import type { DrawCommand, AnchorEntry, PDFMetadata, PDFSecurity, BookmarkEntry, StructNode } from '../types/index.js'
-import { isMcrRef } from '../types/index.js'
+import { isStructNode } from '../types/index.js'
 import type { CounterMap } from './counters.js'
-
-export type { StructNode }
 
 export const PX_PER_PT = 96 / 72
 
@@ -34,7 +32,11 @@ export interface HTMLToPDFOptions {
   // the tag tree) — see src/pdf/finalize.ts's applyPdfA
   taggedPdf?: boolean | undefined
   pdfA?:      boolean | undefined
+  // PDF/UA-1 on top of taggedPdf (implied); requires metadata.title
+  pdfUA?:     boolean | undefined
 }
+
+export interface StackLayer { z: number; commands: DrawCommand[] }
 
 export interface WalkerCtx {
   containerRect:   DOMRect
@@ -47,7 +49,7 @@ export interface WalkerCtx {
   opacityStack:    number[]
   blendStack:      string[]
   // shared by reference on purpose: counters advance in DOM order even where
-  // the z-sort branch reorders the painted output
+  // stacking reorders the painted output
   counters:        CounterMap
   // D3: undefined entirely when tagging is off, so every existing render
   // path (taggedPdf/pdfA unset) pays zero cost and produces byte-identical
@@ -57,6 +59,7 @@ export interface WalkerCtx {
     stack:         StructNode[]
     mcidCounters:  Map<number, number>
     artifactDepth: number
+    annotCount:    number
   }
   // D1 (AcroForm): a stable, auto-incrementing suffix for form controls
   // with no `name` attribute — field names must be unique per document.
@@ -67,6 +70,17 @@ export interface WalkerCtx {
   // the same auto-generated name, the exact hazard `counters` (a Map,
   // reference-shared for the same reason) already documents above.
   fieldCounter: { n: number }
+  // glyph-box top to baseline, per font: measured once with a probe, since a probe per text
+  // node forces a relayout each time (quadratic in text nodes). Shared across forks.
+  baselineOffsets: Map<string, number>
+  // each element's -webkit-line-clamp box, asked by every text node below it; per capture,
+  // since fromDOM may walk a live element whose styles change between exports
+  clampBoxes: Map<Element, Element | null>
+  // positioned and z-indexed descendants of the stacking context being painted, collected
+  // here so they paint above (or, at negative z, below) its normal flow; see walk.ts
+  stacking?:       StackLayer[] | undefined
+  // counter names the element being walked's earlier siblings instantiated (walkChildren)
+  siblingCounters?: readonly string[] | undefined
   // position:fixed content: matches CSS Paged Media semantics (repeats on
   // every page box) rather than normal continuous-scroll "pinned to
   // viewport" semantics — see walk.ts's captureFixedElement and index.ts's
@@ -143,6 +157,8 @@ function structTagFor(el: Element, tag: string): string {
   const role = el.getAttribute('role')
   if (role === 'presentation' || role === 'none') return 'Artifact'
   if (el.getAttribute('aria-hidden') === 'true') return 'Artifact'
+  // an empty alt marks a decorative image, as in HTML
+  if (tag === 'IMG' && el.getAttribute('alt') === '') return 'Artifact'
   switch (tag) {
     case 'H1': case 'H2': case 'H3': case 'H4': case 'H5': case 'H6': return tag
     case 'P':     return 'P'
@@ -157,9 +173,20 @@ function structTagFor(el: Element, tag: string): string {
     case 'TH':    return 'TH'
     case 'IMG': case 'SVG': return 'Figure'
     case 'A':     return 'Link'
+    case 'INPUT': case 'SELECT': case 'TEXTAREA': return 'Form'
     case 'SPAN':  return 'Span'
     default:      return 'Div'
   }
+}
+
+// The cells a TH heads: its own scope attribute, else its columns in a table head, else its
+// row when the row also holds data cells
+function headerScope(el: Element): 'Row' | 'Column' {
+  const attr = el.getAttribute('scope')?.toLowerCase()
+  if (attr === 'row' || attr === 'rowgroup') return 'Row'
+  if (attr === 'col' || attr === 'colgroup') return 'Column'
+  if (el.closest('thead')) return 'Column'
+  return el.parentElement && Array.from(el.parentElement.children).some(c => c.tagName === 'TD') ? 'Row' : 'Column'
 }
 
 // Pushes a new structure node for `el` as a child of whatever is currently
@@ -177,11 +204,23 @@ export function enterStruct(el: Element, tag: string, ctx: WalkerCtx): StructNod
   }
   const node: StructNode = { tag: structTag, kids: [] }
   if (structTag === 'Figure') {
-    const alt = el.getAttribute('alt')
+    const alt = el.getAttribute('alt') || el.getAttribute('aria-label') ||
+      (tag === 'SVG' ? el.querySelector(':scope > title')?.textContent.trim() : undefined)
     if (alt) node.alt = alt
   }
+  if (structTag === 'TH') node.scope = headerScope(el)
   const lang = (el as HTMLElement).lang
   if (lang) node.lang = lang
+  ctx.struct.stack.at(-1)?.kids.push(node)
+  ctx.struct.stack.push(node)
+  return node
+}
+
+// A structure node with no element of its own (a list item's Lbl and LBody), under the
+// innermost one; undefined when tagging is off or inside an artifact
+export function enterStructTag(ctx: WalkerCtx, tag: string): StructNode | undefined {
+  if (!ctx.struct || ctx.struct.artifactDepth > 0) return undefined
+  const node: StructNode = { tag, kids: [] }
   ctx.struct.stack.at(-1)?.kids.push(node)
   ctx.struct.stack.push(node)
   return node
@@ -220,6 +259,17 @@ export function tagStructContent(ctx: WalkerCtx, page: number): { mcid: number; 
   return { mcid, tag: parent.tag }
 }
 
+// Tagged PDF puts each link or form-field annotation in its structure element (an OBJR
+// there, a /StructParent on the annotation); returns the key that pairs the two
+export function tagStructAnnot(ctx: WalkerCtx, page: number): number | undefined {
+  if (!ctx.struct || ctx.struct.artifactDepth > 0) return undefined
+  const parent = ctx.struct.stack.at(-1)
+  if (!parent || parent.tag === 'Root') return undefined
+  const annot = ctx.struct.annotCount++
+  parent.kids.push({ annot, page })
+  return annot
+}
+
 // fromDOM's own pageCount forgiveness can drop a sub-pixel-overshoot
 // trailing page's worth of DrawCommands AFTER the walk already tagged some
 // of them — this mirrors that same filter on the struct tree, so it never
@@ -227,9 +277,9 @@ export function tagStructContent(ctx: WalkerCtx, page: number): { mcid: number; 
 // the final command list. Recursively removes now-empty nodes the same
 // way exitStruct does.
 export function pruneStructTreePages(node: StructNode, pageCount: number): void {
-  node.kids = node.kids.filter(kid => isMcrRef(kid) ? kid.page <= pageCount : true)
+  node.kids = node.kids.filter(kid => isStructNode(kid) || kid.page <= pageCount)
   for (const kid of node.kids) {
-    if (!isMcrRef(kid)) pruneStructTreePages(kid, pageCount)
+    if (isStructNode(kid)) pruneStructTreePages(kid, pageCount)
   }
-  node.kids = node.kids.filter(kid => isMcrRef(kid) || kid.kids.length > 0)
+  node.kids = node.kids.filter(kid => !isStructNode(kid) || kid.kids.length > 0)
 }

@@ -423,10 +423,10 @@ function emitSymbols(bw: BitWriter, block: Block, lit: Codes, dist: Codes): void
       const len = block.lits[i]!
       const lc = lenCode(len)
       bw.writeCode(lit.codes[257 + lc]!, lit.lengths[257 + lc]!)
-      if (LEN_EXTRA[lc]!) bw.write(len - LEN_BASE[lc]!, LEN_EXTRA[lc]!)
+      if (LEN_EXTRA[lc]!) bw.write(len - LEN_BASE[lc]!, LEN_EXTRA[lc])
       const dc = distCode(d)
       bw.writeCode(dist.codes[dc]!, dist.lengths[dc]!)
-      if (DIST_EXTRA[dc]!) bw.write(d - DIST_BASE[dc]!, DIST_EXTRA[dc]!)
+      if (DIST_EXTRA[dc]!) bw.write(d - DIST_BASE[dc]!, DIST_EXTRA[dc])
     }
   }
   bw.writeCode(lit.codes[256]!, lit.lengths[256]!)

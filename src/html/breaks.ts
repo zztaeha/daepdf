@@ -15,18 +15,19 @@ function isOutOfFlow(cs: CSSStyleDeclaration): boolean {
   return cs.position === 'absolute' || cs.position === 'fixed'
 }
 
+// the forced page breaks; legacy page-break-*: always already computes to page
+const FORCED_BREAKS = new Set(['page', 'left', 'right', 'recto', 'verso'])
+
 function wantsBreakBefore(cs: CSSStyleDeclaration): boolean {
-  const v = (cs as any).breakBefore ?? ''
-  return v === 'page' || v === 'left' || v === 'right' || v === 'always'
+  return FORCED_BREAKS.has((cs as any).breakBefore)
 }
 
 function wantsBreakAfter(cs: CSSStyleDeclaration): boolean {
-  const v = (cs as any).breakAfter ?? ''
-  return v === 'page' || v === 'left' || v === 'right' || v === 'always'
+  return FORCED_BREAKS.has((cs as any).breakAfter)
 }
 
 function avoidsBreakInside(cs: CSSStyleDeclaration): boolean {
-  const v = (cs as any).breakInside ?? ''
+  const v = (cs as any).breakInside
   return v === 'avoid' || v === 'avoid-page'
 }
 
@@ -153,11 +154,11 @@ function repeatThead(tr: Element): void {
   if (tr.closest('thead')) return // a header row must not repeat above itself
   const table = tr.closest('table')
   if (!table) return
-  const thead = table.querySelector(':scope > thead') as HTMLTableSectionElement | null
+  const thead = table.querySelector<HTMLTableSectionElement>(':scope > thead')
   if (!thead || !thead.rows.length) return
   const parent = tr.parentNode
   if (!parent) return
-  const frag = (tr.ownerDocument ?? document).createDocumentFragment()
+  const frag = tr.ownerDocument.createDocumentFragment()
   for (const row of Array.from(thead.rows)) {
     const clone = row.cloneNode(true) as HTMLElement
     clone.setAttribute(BREAK_ATTR, '')
@@ -195,7 +196,7 @@ function findViolation(
 
   const walkEl = (el: Element): void => {
     const cs = getComputedStyle(el)
-    // the root is itself position:fixed (createHiddenContainer, previewHTML),
+    // the root is itself out of flow (createHiddenContainer, previewHTML),
     // so the out-of-flow skip applies to descendants only
     if (el !== root) {
       if (cs.display === 'none' || isOutOfFlow(cs)) return
@@ -247,7 +248,7 @@ function findViolation(
   }
 
   const walkText = (textNode: Text): void => {
-    const range = (textNode.ownerDocument ?? document).createRange()
+    const range = textNode.ownerDocument.createRange()
     range.selectNodeContents(textNode)
     const rects = Array.from(range.getClientRects()).filter(r => r.height > 0.5 && r.width > 0.1)
     for (const r of rects) {
@@ -265,7 +266,7 @@ function findViolation(
 // Split the text node where the crossing line starts and push that line to the
 // next page top; the line already starts at a wrap point, so wrapping survives.
 function fixTextLine(textNode: Text, lineTop: number, containerTop: number, pageHPx: number): boolean {
-  const doc   = textNode.ownerDocument ?? document
+  const doc   = textNode.ownerDocument
   const range = doc.createRange()
   const len   = textNode.length
   let splitAt = -1
@@ -330,7 +331,7 @@ function findLineBlock(node: Node): Element | null {
 // orphans/widows-adjusted split line can sit in a different text node than the
 // one that reported the crossing (a paragraph split across a <b> boundary).
 function fixLineAcrossBlock(block: Element, targetTop: number, containerTop: number, pageHPx: number): boolean {
-  const doc     = block.ownerDocument ?? document
+  const doc     = block.ownerDocument
   const walker  = doc.createTreeWalker(block, NodeFilter.SHOW_TEXT)
   const range   = doc.createRange()
   let node: Node | null
@@ -361,7 +362,7 @@ function fixTextLineWithOrphansWidows(textNode: Text, lineTop: number, container
   // per crossing line, not per line
   if (orphans <= 1 && widows <= 1) return fixTextLine(textNode, lineTop, containerTop, pageHPx)
 
-  const doc = textNode.ownerDocument ?? document
+  const doc = textNode.ownerDocument
   const blockRange = doc.createRange()
   blockRange.selectNodeContents(block)
   const lineRects = Array.from(blockRange.getClientRects()).filter(r => r.height > 0.5 && r.width > 0.1)
@@ -382,13 +383,23 @@ function fixTextLineWithOrphansWidows(textNode: Text, lineTop: number, container
   return fixLineAcrossBlock(block, lineRects[splitIdx]!.top, containerTop, pageHPx)
 }
 
+const BREAK_PROPS = /break-(?:before|after|inside)/
+
+// The app's own stylesheets apply to templates too, so a forced break can come from them.
+// An unreadable (cross-origin) sheet might hold one.
+function sheetsMightBreak(doc: Document): boolean {
+  return Array.from(doc.styleSheets).some(sheet => {
+    try { return Array.from(sheet.cssRules).some(rule => BREAK_PROPS.test(rule.cssText)) } catch { return true }
+  })
+}
+
 export function applyPageBreaks(root: HTMLElement, pageHPx: number): void {
   if (pageHPx <= 0) return
   // single-page content can't overflow a boundary, but break-before/after/inside
   // can force one on short content. A substring check is far cheaper than a
   // getComputedStyle walk, and CSS scoping never rewrites property names.
-  const mightBreak = /break-(?:before|after|inside)/.test(root.innerHTML)
-  if (!mightBreak && root.scrollHeight <= pageHPx + 0.5) return
+  const short = root.scrollHeight <= pageHPx + 0.5
+  if (short && !BREAK_PROPS.test(root.innerHTML) && !sheetsMightBreak(root.ownerDocument)) return
 
   const skip = new Set<Node>()
   for (let i = 0; i < MAX_FIXES; i++) {

@@ -1,5 +1,6 @@
 import type { PathSeg, Color, ColorAlpha, Gradient, GradientStop } from '../types/index.js'
 import { parseSvgPath } from '../html/clippath.js'
+import { IDENTITY, composeAffine, type Affine } from '../types/affine.js'
 
 export interface VectorShape {
   ops:         PathSeg[]
@@ -15,25 +16,8 @@ export interface VectorShape {
   opacity?:     number
 }
 
-// SVG's own transform-attribute matrix convention (x'=a*x+c*y+e, y'=b*x+d*y+f)
-// — the same convention html/transform.ts's Affine uses, kept separate here
-// since svgvector's points stay in DOM/CSS Y-down page-relative pt the whole
-// way through (PdfDoc's own Y-flip, shared with every other path/clip
-// already, happens exactly once at the bottom — see fill_path/set_clip_path),
-// never needing the CSS-transform module's PDF-Y-up conjugation.
-type Affine = [number, number, number, number, number, number]
-const IDENTITY: Affine = [1, 0, 0, 1, 0, 0]
-
-function composeAffine(m2: Affine, m1: Affine): Affine {
-  const [a1, b1, c1, d1, e1, f1] = m1
-  const [a2, b2, c2, d2, e2, f2] = m2
-  return [
-    a2 * a1 + c2 * b1, b2 * a1 + d2 * b1,
-    a2 * c1 + c2 * d1, b2 * c1 + d2 * d1,
-    a2 * e1 + c2 * f1 + e2, b2 * e1 + d2 * f1 + f2,
-  ]
-}
-
+// Points stay in DOM/CSS Y-down page-relative pt the whole way through; PdfDoc's own
+// Y-flip, shared with every other path and clip, happens once at the bottom.
 function transformOps(ops: PathSeg[], m: Affine): PathSeg[] {
   return ops.map(seg => {
     const args = seg.args
@@ -77,13 +61,20 @@ function parseSvgTransformAttr(attr: string): Affine {
   return m
 }
 
-const NAMED: Record<string, ColorAlpha> = {
-  black: [0,0,0,255], white: [255,255,255,255], red: [255,0,0,255], green: [0,128,0,255],
-  blue: [0,0,255,255], gray: [128,128,128,255], grey: [128,128,128,255], yellow: [255,255,0,255],
-  orange: [255,165,0,255], purple: [128,0,128,255], pink: [255,192,203,255], brown: [165,42,42,255],
-  cyan: [0,255,255,255], magenta: [255,0,255,255], lime: [0,255,0,255], navy: [0,0,128,255],
-  teal: [0,128,128,255], maroon: [128,0,0,255], silver: [192,192,192,255], none: [0,0,0,0],
-  transparent: [0,0,0,0],
+// Anything else CSS accepts (all named colors, hsl(), hwb(), ...) is normalized by the
+// browser's own parser: a canvas fillStyle reads back as #rrggbb or rgba().
+let colorProbe: CanvasRenderingContext2D | null | undefined
+function browserColor(v: string): ColorAlpha | null {
+  colorProbe ??= document.createElement('canvas').getContext('2d')
+  if (!colorProbe) return null
+  const read = (sentinel: string) => { colorProbe!.fillStyle = sentinel; colorProbe!.fillStyle = v; return String(colorProbe!.fillStyle) }
+  const out = read('#000001')
+  // an invalid value leaves the sentinel in place; a second, different sentinel tells them apart
+  if (out !== read('#000002')) return null
+  const hex = out.match(/^#([0-9a-f]{6})$/)
+  if (hex) { const n = parseInt(hex[1]!, 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255, 255] }
+  const m = out.match(/^rgba?\(\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)$/)
+  return m ? [+m[1]!, +m[2]!, +m[3]!, m[4] !== undefined ? Math.round(+m[4] * 255) : 255] : null
 }
 
 // SVG attribute color values (fill="#f00"/"red"/"rgb(...)"/"none") aren't run
@@ -102,7 +93,8 @@ function parseSvgColor(v: string | null | undefined, currentColor: ColorAlpha): 
   if (hex3) { const [r = '0', g = '0', b = '0'] = hex3[1]!; return [parseInt(r+r,16), parseInt(g+g,16), parseInt(b+b,16), 255] }
   const rgbM = s.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)$/)
   if (rgbM) return [+rgbM[1]!, +rgbM[2]!, +rgbM[3]!, rgbM[4] !== undefined ? Math.round(+rgbM[4]*255) : 255]
-  return NAMED[s] ?? null
+  if (s === 'transparent') return [0, 0, 0, 0]
+  return browserColor(s)
 }
 
 function parseNumOr(v: string | null | undefined, fallback: number): number {
@@ -124,12 +116,29 @@ function parsePercentOrNum(v: string | null | undefined, fallback: number): numb
 // the existing raster path (rasterizeSVGs), never a partial conversion
 const BAIL_TAGS = ['filter', 'mask', 'pattern', 'clipPath', 'foreignObject', 'text', 'style', 'image', 'tspan', 'textPath']
 
+// A gradient the vector path can paint: its own stops (not inherited through href) in
+// objectBoundingBox units
+function isPlainGradient(el: Element | null): boolean {
+  if (!el || (el.tagName !== 'linearGradient' && el.tagName !== 'radialGradient')) return false
+  return el.getElementsByTagName('stop').length >= 2 && el.getAttribute('gradientUnits') !== 'userSpaceOnUse'
+}
+
 function hasBailFeature(doc: Document): boolean {
   for (const tag of BAIL_TAGS) if (doc.getElementsByTagName(tag).length) return true
+  // a nested <svg> opens its own viewport, which the walk doesn't model
+  if (doc.getElementsByTagName('svg').length > 1) return true
   for (const el of Array.from(doc.getElementsByTagName('*'))) {
     for (const attr of ['filter', 'mask', 'clip-path']) {
       const v = el.getAttribute(attr)
       if (v && v.trim().startsWith('url(')) return true
+    }
+    // any paint server other than a plain gradient fill (gradient strokes, missing or
+    // href-chained gradients) is painted by the raster path instead
+    const style = el.getAttribute('style') ?? ''
+    for (const prop of ['fill', 'stroke']) {
+      const v = style.match(new RegExp(`(?:^|;)\\s*${prop}\\s*:\\s*(url\\([^)]*\\))`))?.[1] ?? el.getAttribute(prop)
+      const ref = v?.trim().match(/^url\(\s*["']?#([^"')]+)["']?\s*\)/)
+      if (v?.trim().startsWith('url(') && (prop === 'stroke' || !ref || !isPlainGradient(doc.getElementById(ref[1]!)))) return true
     }
   }
   return false
@@ -143,7 +152,6 @@ interface GradientDef {
   fx: number; fy: number
   x1: number; y1: number; x2: number; y2: number
   stops: GradientStop[]
-  userSpaceOnUse: boolean
   // applied to cx/cy/fx/fy (radial) or x1/y1/x2/y2 (linear) at resolve time,
   // in the SAME bbox-fractional space those coordinates are already defined
   // in — same transform-list syntax as the `transform` attribute
@@ -167,8 +175,10 @@ function parseGradientDefs(doc: Document, currentColor: ColorAlpha): Map<string,
         const styleColor = style.match(/stop-color\s*:\s*([^;]+)/)?.[1]
         const styleOpacity = style.match(/stop-opacity\s*:\s*([^;]+)/)?.[1]
         const color = parseSvgColor(styleColor ?? stopEl.getAttribute('stop-color') ?? 'black', currentColor) ?? [0,0,0,255]
-        const opacity = parseFloat(styleOpacity ?? stopEl.getAttribute('stop-opacity') ?? '1')
-        stops.push({ position: Math.max(0, Math.min(1, offset)), color: [color[0], color[1], color[2], Math.round(opacity*255)] })
+        const opacity = parseNumOr(styleOpacity ?? stopEl.getAttribute('stop-opacity'), 1)
+        // stop-opacity scales the color's own alpha ("transparent" is black at 0, not opaque)
+        const alpha = Math.round(Math.max(0, Math.min(1, opacity)) * color[3])
+        stops.push({ position: Math.max(0, Math.min(1, offset)), color: [color[0], color[1], color[2], alpha] })
       }
       if (stops.length < 2) continue
       const cx = parsePercentOrNum(el.getAttribute('cx'), 0.5)
@@ -182,7 +192,6 @@ function parseGradientDefs(doc: Document, currentColor: ColorAlpha): Map<string,
         x1: parsePercentOrNum(el.getAttribute('x1'), 0), y1: parsePercentOrNum(el.getAttribute('y1'), 0),
         x2: parsePercentOrNum(el.getAttribute('x2'), 1), y2: parsePercentOrNum(el.getAttribute('y2'), 0),
         stops,
-        userSpaceOnUse: el.getAttribute('gradientUnits') === 'userSpaceOnUse',
         gradientTransform: el.hasAttribute('gradientTransform')
           ? parseSvgTransformAttr(el.getAttribute('gradientTransform')!)
           : IDENTITY,
@@ -204,6 +213,7 @@ interface Style {
   // is needed beyond the keyword -> index lookup itself
   lineCap: number
   lineJoin: number
+  evenOdd: boolean
 }
 
 const CAP_MAP:  Record<string, number> = { butt: 0, round: 1, square: 2 }
@@ -220,11 +230,12 @@ function readStyle(el: Element, inherited: Style, currentColor: ColorAlpha): Sty
   const dashRaw   = styleAttr('stroke-dasharray') ?? el.getAttribute('stroke-dasharray')
   const capRaw    = styleAttr('stroke-linecap') ?? el.getAttribute('stroke-linecap')
   const joinRaw   = styleAttr('stroke-linejoin') ?? el.getAttribute('stroke-linejoin')
+  const ruleRaw   = styleAttr('fill-rule') ?? el.getAttribute('fill-rule')
   let dash = inherited.dash
-  if (dashRaw !== undefined && dashRaw !== null) {
+  if (dashRaw !== null) {
     if (dashRaw === 'none') dash = null
     else {
-      const nums = dashRaw.trim().split(/[\s,]+/).map(Number).filter(n => !Number.isNaN(n) && n >= 0)
+      const nums = dashRaw.trim().split(/[\s,]+/).map(parseFloat).filter(n => !Number.isNaN(n) && n >= 0)
       dash = nums.length ? nums : null
     }
   }
@@ -240,6 +251,7 @@ function readStyle(el: Element, inherited: Style, currentColor: ColorAlpha): Sty
     dash,
     lineCap:  capRaw  != null && CAP_MAP[capRaw]  !== undefined ? CAP_MAP[capRaw]  : inherited.lineCap,
     lineJoin: joinRaw != null && JOIN_MAP[joinRaw] !== undefined ? JOIN_MAP[joinRaw] : inherited.lineJoin,
+    evenOdd:  ruleRaw === 'evenodd' ? true : ruleRaw === 'nonzero' ? false : inherited.evenOdd,
   }
 }
 
@@ -318,18 +330,23 @@ const XLINK_NS = 'http://www.w3.org/1999/xlink'
 function walk(
   el: Element, matrix: Affine, inherited: Style,
   gradientDefs: Map<string, GradientDef>, out: VectorShape[], currentColor: ColorAlpha,
-  useDepth = 0,
+  useDepth = 0, groupOpacity = 1,
 ): void {
   const tag = el.tagName
   if (tag === 'defs') return // definitions only, never painted directly
+  // presentation attribute or inline style; an <img>'s SVG file keeps its own
+  const prop = (name: string) => (el.getAttribute('style') ?? '').match(new RegExp(`(?:^|;)\\s*${name}\\s*:\\s*([^;]+)`))?.[1]?.trim() ?? el.getAttribute(name)
+  if (prop('display') === 'none') return
 
   const local = el.getAttribute('transform')
   const m = local ? composeAffine(matrix, parseSvgTransformAttr(local)) : matrix
   const style = readStyle(el, inherited, currentColor)
-  const elOpacity = parsePercentOrNum(el.getAttribute('opacity'), 1)
+  // a group's opacity reaches its children as a multiplier: exact for non-overlapping
+  // children, the same approximation the HTML opacity stack makes
+  const elOpacity = parsePercentOrNum(prop('opacity'), 1) * groupOpacity
 
   if (tag === 'g' || tag === 'svg' || tag === 'a') {
-    for (const child of Array.from(el.children)) walk(child, m, style, gradientDefs, out, currentColor, useDepth)
+    for (const child of Array.from(el.children)) walk(child, m, style, gradientDefs, out, currentColor, useDepth, elOpacity)
     return
   }
 
@@ -349,10 +366,25 @@ function walk(
     const x = parseFloat(el.getAttribute('x') ?? '') || 0
     const y = parseFloat(el.getAttribute('y') ?? '') || 0
     const um = (x || y) ? composeAffine(m, [1, 0, 0, 1, x, y]) : m
-    walk(target, um, style, gradientDefs, out, currentColor, useDepth + 1)
+    if (target.tagName !== 'symbol') {
+      walk(target, um, style, gradientDefs, out, currentColor, useDepth + 1, elOpacity)
+      return
+    }
+    // a symbol only renders through a <use>: its viewBox maps into the use's box when
+    // both are given (meet, centered), otherwise it shares the use's coordinates
+    const vb = (target.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number)
+    const uw = parseFloat(el.getAttribute('width') ?? ''), uh = parseFloat(el.getAttribute('height') ?? '')
+    let sm = um
+    if (vb.length === 4 && vb.every(Number.isFinite) && vb[2]! > 0 && vb[3]! > 0 && uw > 0 && uh > 0) {
+      const k = Math.min(uw / vb[2]!, uh / vb[3]!)
+      sm = composeAffine(um, [k, 0, 0, k, (uw - vb[2]! * k) / 2 - vb[0]! * k, (uh - vb[3]! * k) / 2 - vb[1]! * k])
+    }
+    const symStyle = readStyle(target, style, currentColor)
+    for (const child of Array.from(target.children)) walk(child, sm, symStyle, gradientDefs, out, currentColor, useDepth + 1, elOpacity)
     return
   }
 
+  if (prop('visibility') === 'hidden') return
   const rawOps = shapeToOps(el)
   if (!rawOps || !rawOps.length) return
   const ops = transformOps(rawOps, m)
@@ -361,13 +393,12 @@ function walk(
   const fillRef = !isLine ? fillUrlRef(el) : null
   const shape: VectorShape = {
     ops,
-    evenOdd: (el.getAttribute('fill-rule') ?? '') === 'evenodd',
+    evenOdd: style.evenOdd,
     opacity: elOpacity,
   }
 
   if (fillRef && gradientDefs.has(fillRef)) {
     const g = gradientDefs.get(fillRef)!
-    if (g.userSpaceOnUse) return // out of scope — bail this shape rather than mis-paint it
     const bbox = bboxOfOps(ops)
     const gStops = g.stops.map(s => ({ position: s.position, color: s.color }))
     if (g.isRadial) {
@@ -382,7 +413,7 @@ function walk(
       // CSS radial-gradients already rely on)
       const [tcx, tcy] = applyAffine(g.gradientTransform, g.cx, g.cy)
       const [tfx, tfy] = applyAffine(g.gradientTransform, g.fx, g.fy)
-      shape.gradient = { type: 'radial', cx: tcx, cy: tcy, fx: tfx, fy: tfy, stops: gStops }
+      shape.gradient = { type: 'radial', cx: tcx, cy: tcy, fx: tfx, fy: tfy, rx: g.r, ry: g.r, straightAlpha: true, stops: gStops }
     } else {
       // SVG's x1/y1->x2/y2 vector lives in Y-DOWN space; the downstream
       // consumer (build_resources.ts's ShadingType 2, shared with CSS
@@ -402,14 +433,14 @@ function walk(
       const [tx2, ty2] = applyAffine(g.gradientTransform, g.x2, g.y2)
       const dx = tx2 - tx1, dy = -(ty2 - ty1)
       const angle = Math.atan2(dx, dy) * 180 / Math.PI
-      shape.gradient = { type: 'linear', angle, stops: gStops }
+      shape.gradient = { type: 'linear', angle, straightAlpha: true, stops: gStops }
     }
     shape.gradientBox = bbox
-  } else if (!isLine && style.fill) {
+  } else if (!isLine && style.fill && style.fill[3] > 0) {
     shape.fill = [style.fill[0], style.fill[1], style.fill[2]]
   }
 
-  if (style.stroke) {
+  if (style.stroke && style.stroke[3] > 0) {
     shape.stroke = [style.stroke[0], style.stroke[1], style.stroke[2]]
     // stroke-width is in the SAME user-space units as geometry, so it must
     // scale with the shape's own transform — approximated via the matrix's
@@ -429,12 +460,11 @@ function walk(
 
   if (!shape.fill && !shape.gradient && !shape.stroke) return
 
-  // fill-opacity/stroke-opacity are separate per spec, but a single PDF fill+
-  // stroke operator (B/B*/f/S) shares one alpha ExtGState — folding the
-  // fill's own opacity in (falling back to the stroke's when there's no
-  // fill at all) is a stated simplification for the fill+stroke-with-
-  // DIFFERENT-opacities case, which is rare in practice
-  const propOpacity = shape.fill || shape.gradient ? style.fillOpacity : style.strokeOpacity
+  // a fill+stroke shares one ExtGState alpha, so the fill's opacity wins (the stroke's when
+  // there is no fill); an rgba() or transparent paint color's own alpha multiplies in
+  const propOpacity = shape.gradient ? style.fillOpacity
+    : shape.fill ? style.fillOpacity * style.fill![3] / 255
+    : style.strokeOpacity * style.stroke![3] / 255
   shape.opacity = elOpacity * propOpacity
 
   out.push(shape)
@@ -458,7 +488,7 @@ export function svgToVectorShapes(
   } catch { return null }
   if (doc.getElementsByTagName('parsererror').length) return null
   const root = doc.documentElement
-  if (!root || root.tagName !== 'svg') return null
+  if (root.tagName !== 'svg') return null
   if (hasBailFeature(doc)) return null
 
   const viewBoxAttr = root.getAttribute('viewBox')
@@ -511,7 +541,7 @@ export function svgToVectorShapes(
   )
 
   const gradientDefs = parseGradientDefs(doc, currentColor)
-  const defaultStyle: Style = { fill: [0,0,0,255], stroke: null, strokeWidth: 1, fillOpacity: 1, strokeOpacity: 1, dash: null, lineCap: 0, lineJoin: 0 }
+  const defaultStyle: Style = { fill: [0,0,0,255], stroke: null, strokeWidth: 1, fillOpacity: 1, strokeOpacity: 1, dash: null, lineCap: 0, lineJoin: 0, evenOdd: false }
   // the root <svg> element can itself carry fill/stroke/etc. (a document-wide
   // default) — resolve it once here rather than hardcoding SVG's own initial
   // values as the base every child inherits from

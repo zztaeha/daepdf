@@ -1,10 +1,10 @@
-// The page-break engine needs a real layout engine, so these run inside
-// headless Chrome: CHROME_BIN, a standard install, or puppeteer's cache.
+// The page-break engine needs a real layout engine, so these run inside headless Chrome.
 import { build } from 'esbuild'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { findChrome } from './chrome.mjs'
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const PAGE_H = 841.89 * 96 / 72
@@ -88,28 +88,6 @@ for (const html of FIXTURES) {
 }
 document.getElementById('out').textContent = JSON.stringify(results)
 </script>`
-
-function findChrome() {
-  const home = homedir()
-  const cached = (sub, tail) => {
-    const base = path.join(home, '.cache', 'puppeteer', sub)
-    if (!existsSync(base)) return []
-    return readdirSync(base).sort().reverse().flatMap(v => {
-      const dir = path.join(base, v)
-      return readdirSync(dir).map(d => path.join(dir, d, tail))
-    })
-  }
-  const candidates = [
-    process.env.CHROME_BIN,
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    '/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser',
-    ...cached('chrome-headless-shell', 'chrome-headless-shell'),
-    ...cached('chrome', 'Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'),
-    ...cached('chrome', 'chrome'),
-  ]
-  return candidates.find(c => c && existsSync(c)) ?? null
-}
 
 async function runInChrome(chrome) {
   const dir = mkdtempSync(path.join(tmpdir(), 'daepdf-breaks-'))

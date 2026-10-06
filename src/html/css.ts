@@ -82,7 +82,7 @@ function components(inner: string): { c: string[]; alpha: number } | null {
   return { c, alpha: Math.max(0, Math.min(1, alpha)) }
 }
 
-export function parseColor4(css: string): ColorAlpha | null {
+function parseColor4(css: string): ColorAlpha | null {
   const m = css.trim().match(/^([a-z]+)\(([^)]*)\)$/i)
   if (!m) return null
   const fn = (m[1] ?? '').toLowerCase()
@@ -165,10 +165,22 @@ export function splitPositionPair(v: string): string[] {
   return v.trim().split(/\s+(?![^()]*\))/)
 }
 
-function parseCSSGradientStops(s: string): GradientStop[] {
-  const parts = splitByTopLevelComma(s)
+// "in oklab", "in hsl longer hue": the space a gradient interpolates in. The PDF interpolates
+// in sRGB either way, so the clause is dropped instead of being misread as a stop or direction.
+const INTERPOLATION = /\s*\bin\s+[a-z][a-z0-9-]*(?:\s+(?:shorter|longer|increasing|decreasing)\s+hue)?\s*/i
+
+function withoutInterpolation(parts: string[]): string[] {
+  const head = parts[0]
+  if (head === undefined || !INTERPOLATION.test(head)) return parts
+  const rest = head.replace(INTERPOLATION, ' ').trim()
+  return rest ? [rest, ...parts.slice(1)] : parts.slice(1)
+}
+
+// A stop without a position gets NaN here; fixupStopPositions spreads it once px positions
+// have resolved against the box. Hints ("30%") are not stops and are skipped.
+function parseCSSGradientStops(parts: string[]): GradientStop[] {
   const stops: GradientStop[] = []
-  for (const [i, part] of parts.entries()) {
+  for (const part of parts) {
     // token 0 is the color, the rest are positions ("red 20% 40%" is a double-position
     // stop: the same color at both). A position the color parser would choke on (px,
     // calc) must never take the whole stop down with it — losing one stop can silently
@@ -176,22 +188,42 @@ function parseCSSGradientStops(s: string): GradientStop[] {
     const toks = splitPositionPair(part)
     const c = parseColorAlpha(toks[0] ?? '', true)
     if (!c) continue
-    const fallback = i / Math.max(1, parts.length - 1)
-    const posToks  = toks.slice(1, 3)
+    const posToks = toks.slice(1, 3)
     if (!posToks.length) {
-      stops.push({ color: c, position: fallback })
+      stops.push({ color: c, position: NaN })
       continue
     }
     for (const tok of posToks) {
       const pctM = tok.match(/^(-?[\d.]+)%$/)
       const pxM  = tok.match(/^(-?[\d.]+)px$/)
       if (pctM)     stops.push({ color: c, position: +pctM[1]! / 100 })
-      else if (pxM) stops.push({ color: c, position: fallback, posPx: +pxM[1]! })
-      // calc()/em — position unresolvable, keep the color at the interpolated spot
-      else          stops.push({ color: c, position: fallback })
+      else if (pxM) stops.push({ color: c, position: NaN, posPx: +pxM[1]! })
+      // calc()/em: unresolvable, so it takes an implicit position
+      else          stops.push({ color: c, position: NaN })
     }
   }
   return stops
+}
+
+// CSS Images 3 §3.5.3: a missing first/last position is 0/1, a position below an earlier one
+// is raised to it, and each run without one spreads evenly between its neighbors.
+function fixupStopPositions(stops: GradientStop[]): GradientStop[] {
+  const out = stops.map(st => ({ ...st }))
+  const first = out[0], last = out.at(-1)
+  if (!first || !last) return out
+  if (Number.isNaN(first.position)) first.position = 0
+  if (Number.isNaN(last.position)) last.position = 1
+  let max = -Infinity
+  for (const st of out) if (!Number.isNaN(st.position)) { st.position = Math.max(st.position, max); max = st.position }
+  for (let i = 1; i < out.length; i++) {
+    if (!Number.isNaN(out[i]!.position)) continue
+    let j = i
+    while (Number.isNaN(out[j]!.position)) j++
+    const a = out[i - 1]!.position, b = out[j]!.position
+    for (let k = i; k < j; k++) out[k]!.position = a + (b - a) * (k - i + 1) / (j - i + 1)
+    i = j
+  }
+  return out
 }
 
 // Repeating gradients (linear/radial/conic alike): tile the stop pattern across
@@ -237,14 +269,15 @@ export function parseCSSGradient(css: string): Gradient | null {
   const linM = css.match(/^(repeating-)?linear-gradient\((.+)\)$/s)
   if (linM) {
     const repeating = !!linM[1]
-    const inner    = (linM[2] ?? '').trim()
-    let angle      = 180
+    const parts = withoutInterpolation(splitByTopLevelComma((linM[2] ?? '').trim()))
+    let angle = 180
     let corner: string | undefined
-    let rest       = inner
-    const degMatch = inner.match(/^(-?[\d.]+)deg\s*,\s*/)
-    const toMatch  = inner.match(/^to\s+(top|bottom|left|right)(?:\s+(top|bottom|left|right))?\s*,\s*/)
+    const head = parts[0] ?? ''
+    const degMatch = head.match(/^(-?[\d.]+)deg$/)
+    const toMatch  = head.match(/^to\s+(top|bottom|left|right)(?:\s+(top|bottom|left|right))?$/)
     if (degMatch) {
-      angle = +degMatch[1]!; rest = inner.slice(degMatch[0].length)
+      angle = +degMatch[1]!
+      parts.shift()
     } else if (toMatch) {
       const words = [toMatch[1], toMatch[2]].filter(Boolean) as string[]
       const vert  = words.find(kw => kw === 'top' || kw === 'bottom')
@@ -258,33 +291,32 @@ export function parseCSSGradient(css: string): Gradient | null {
       } else {
         angle = { bottom: 180, top: 0, right: 90, left: 270 }[words[0] ?? ''] ?? 180
       }
-      rest = inner.slice(toMatch[0].length)
+      parts.shift()
     }
-    const stops = parseCSSGradientStops(rest)
+    const stops = parseCSSGradientStops(parts)
     if (stops.length >= 2) return { type: 'linear', angle, corner, repeating: repeating || undefined, stops }
   }
 
   const radM = css.match(/^(repeating-)?radial-gradient\((.+)\)$/s)
   if (radM) {
     const repeating = !!radM[1]
-    const inner = (radM[2] ?? '').trim()
-    let cx = 0.5, cy = 0.5, rest = inner
-    const atPos = inner.match(/^[^,]*\bat\s+([\d.]+%?)\s+([\d.]+%?)\s*,\s*/)
-    if (atPos) {
-      cx   = parseFloat(atPos[1]!) / (atPos[1]!.endsWith('%') ? 100 : 1)
-      cy   = parseFloat(atPos[2]!) / (atPos[2]!.endsWith('%') ? 100 : 1)
-      rest = inner.slice(atPos[0].length)
-    } else {
-      // no "at" clause, but a shape/size keyword preamble can still precede the
-      // stop list ("circle, red, blue") — left unstripped, it becomes a bogus
-      // extra token in parseCSSGradientStops' parts list, corrupting every real
-      // stop's implicit fallback position (i/(parts.length-1))
-      const shapeTok = /circle|ellipse|closest-side|closest-corner|farthest-side|farthest-corner|[\d.]+(?:px|%)/
-      const shapeM = new RegExp(`^(?:${shapeTok.source})(?:\\s+(?:${shapeTok.source}))*\\s*,\\s*`).exec(inner)
-      if (shapeM) rest = inner.slice(shapeM[0].length)
+    const parts = withoutInterpolation(splitByTopLevelComma((radM[2] ?? '').trim()))
+    // computed style serializes the preamble as "[circle] [size] [at x y]", with ellipse
+    // (the default) left out and keyword positions already turned into percentages
+    let circle = false, size: string[] | undefined, position: [string, string] | undefined
+    const head = parts[0] ?? ''
+    if (!parseColorAlpha(splitPositionPair(head)[0] ?? '', true)) {
+      const [shapeSize = '', at] = head.split(/\s*\bat\s+/)
+      const toks = shapeSize.trim().split(/\s+/).filter(Boolean)
+      const sizeToks = toks.filter(t => t !== 'circle' && t !== 'ellipse')
+      // a single length can only size a circle
+      circle = toks.includes('circle') || (sizeToks.length === 1 && /\d/.test(sizeToks[0]!))
+      if (sizeToks.length) size = sizeToks
+      if (at) { const p = splitPositionPair(at); position = [p[0] ?? '50%', p[1] ?? '50%'] }
+      parts.shift()
     }
-    const stops = parseCSSGradientStops(rest)
-    if (stops.length >= 2) return { type: 'radial', cx, cy, repeating: repeating || undefined, stops }
+    const stops = parseCSSGradientStops(parts)
+    if (stops.length >= 2) return { type: 'radial', circle: circle || undefined, size, position, repeating: repeating || undefined, stops }
   }
 
   return null
@@ -295,38 +327,32 @@ export function parseCSSConicGradient(css: string): ConicGradient | null {
   const m = css.match(/^(repeating-)?conic-gradient\((.+)\)$/s)
   if (!m) return null
   const repeating = !!m[1]
-  let inner   = (m[2] ?? '').trim()
-  let fromDeg = 0, cx = 0.5, cy = 0.5
+  const parts = withoutInterpolation(splitByTopLevelComma((m[2] ?? '').trim()))
+  let fromDeg = 0, position: [string, string] | undefined
 
-  const pre = inner.match(/^(?:from\s+(-?[\d.]+)deg\s*)?(?:at\s+([\d.]+)%\s+([\d.]+)%\s*)?,\s*/)
+  const pre = (parts[0] ?? '').match(/^(?:from\s+(-?[\d.]+)deg)?\s*(?:at\s+(.+))?$/)
   if (pre && (pre[1] !== undefined || pre[2] !== undefined)) {
     if (pre[1] !== undefined) fromDeg = +pre[1]
-    if (pre[2] !== undefined) { cx = +pre[2] / 100; cy = +(pre[3] ?? 0) / 100 }
-    inner = inner.slice(pre[0].length)
+    if (pre[2] !== undefined) { const p = splitPositionPair(pre[2]); position = [p[0] ?? '50%', p[1] ?? '50%'] }
+    parts.shift()
   }
 
-  const parts = splitByTopLevelComma(inner)
+  // angles (deg or % of a turn) normalized to 0..1; implicit ones spread by the CSS fixup
   const stops: GradientStop[] = []
-  for (const [i, part] of parts.entries()) {
+  for (const part of parts) {
     const toks = splitPositionPair(part)
     const c = parseColorAlpha(toks[0] ?? '', true)
     if (!c) continue
-    const fallback = i / Math.max(1, parts.length - 1)
-    const posToks  = toks.slice(1, 3)
-    if (!posToks.length) {
-      stops.push({ color: c, position: fallback })
-      continue
-    }
+    const posToks = toks.slice(1, 3)
+    if (!posToks.length) { stops.push({ color: c, position: NaN }); continue }
     for (const tok of posToks) {
       const degM = tok.match(/^(-?[\d.]+)deg$/)
       const pctM = tok.match(/^(-?[\d.]+)%$/)
-      if (degM)      stops.push({ color: c, position: +degM[1]! / 360 })
-      else if (pctM) stops.push({ color: c, position: +pctM[1]! / 100 })
-      else           stops.push({ color: c, position: fallback })
+      stops.push({ color: c, position: degM ? +degM[1]! / 360 : pctM ? +pctM[1]! / 100 : NaN })
     }
   }
   if (stops.length < 2) return null
-  return { fromDeg, cx, cy, repeating: repeating || undefined, stops }
+  return { fromDeg, position, repeating: repeating || undefined, stops: fixupStopPositions(stops) }
 }
 
 export function parseCSSBoxShadow(css: string): BoxShadow[] {
@@ -347,7 +373,9 @@ export function parseCSSBoxShadow(css: string): BoxShadow[] {
     }
 
     const colorStr = colorTokens.join(' ')
-    const color    = parseColorAlpha(colorStr) ?? ([0, 0, 0, 180] as ColorAlpha)
+    const color    = parseColorAlpha(colorStr, true) ?? ([0, 0, 0, 180] as ColorAlpha)
+    // a transparent shadow (a focus ring at rest, say) paints nothing
+    if (color[3] === 0) continue
 
     if (lengths.length >= 2) {
       shadows.push({
@@ -362,13 +390,9 @@ export function parseCSSBoxShadow(css: string): BoxShadow[] {
 }
 
 function radiusComponent(str: string, ref: number): number {
-  const pxM = str.match(/^(-?[\d.]+)px$/)
-  if (pxM) return Math.max(0, +pxM[1]! / PX_PER_PT)
   const ptM = str.match(/^(-?[\d.]+)pt$/)
   if (ptM) return Math.max(0, +ptM[1]!)
-  const pctM = str.match(/^(-?[\d.]+)%$/)
-  if (pctM) return Math.max(0, +pctM[1]! / 100 * ref)
-  return 0
+  return Math.max(0, resolveLength(str, ref) ?? 0)
 }
 
 // The CSS overlap constraint: scale every radius down by the largest f ≤ 1 that
@@ -393,7 +417,7 @@ export function parseBorderRadius(s: CSSStyleDeclaration, el?: Element, dims?: {
   // per-axis (h against width, v against height) — that's what makes
   // border-radius:50% an ellipse on a non-square box, per spec.
   const parseCorner = (val: string): Corner => {
-    const parts = val.trim().split(/\s+/)
+    const parts = splitPositionPair(val)
     const hStr  = parts[0] ?? val
     const vStr  = parts[1] ?? hStr
     return { h: radiusComponent(hStr, elW), v: radiusComponent(vStr, elH) }
@@ -458,12 +482,94 @@ export function insetBorderRadius(
 // transparent" — callers that fall back to a default color on null need to tell
 // the two apart, or transparent renders as the fallback
 export function isTransparentColor(css: string): boolean {
-  if (css === 'transparent') return true
-  const m = css.match(/^rgba\([^)]*,\s*([\d.]+)\s*\)$/)
-  return !!m && parseFloat(m[1]!) === 0
+  return parseColorAlpha(css, true)?.[3] === 0
 }
 
 export function pxToPt(s: string): number {
   const m = s.match(/^(-?[\d.]+)px$/)
   return m ? +m[1]! / PX_PER_PT : 0
+}
+
+// A length in pt, against `space` for percentages: px, %, and the calc(a% ± bpx) that
+// mixed values and 4-value positions compute to. Null for anything else.
+export function resolveLength(val: string, space: number): number | null {
+  const pctM = val.match(/^(-?[\d.]+)%$/)
+  if (pctM) return space * (+pctM[1]! / 100)
+  const pxM = val.match(/^(-?[\d.]+)px$/)
+  if (pxM) return +pxM[1]! / PX_PER_PT
+  const calcM = val.match(/^calc\((-?[\d.]+)%\s*([+-])\s*(-?[\d.]+)px\)$/)
+  if (!calcM) return null
+  const base = space * (+calcM[1]! / 100)
+  const off  = +calcM[3]! / PX_PER_PT
+  return calcM[2] === '+' ? base + off : base - off
+}
+
+// A position component in pt; anything unresolvable centers, like an omitted one
+export function parsePositionComponent(val: string | undefined, space: number): number {
+  return (val ? resolveLength(val, space) : null) ?? space / 2
+}
+
+// CSS radial ending shape, in pt. Keywords measure from the center to the box's sides or
+// corners; an ellipse through a corner keeps its side-keyword aspect ratio, scaled by √2.
+function radialExtent(size: string[] | undefined, circle: boolean, cx: number, cy: number, w: number, h: number): [number, number] {
+  const near: [number, number] = [Math.min(cx, w - cx), Math.min(cy, h - cy)]
+  const far:  [number, number] = [Math.max(cx, w - cx), Math.max(cy, h - cy)]
+  const kw = !size ? 'farthest-corner' : size.length === 1 && !/\d/.test(size[0]!) ? size[0]! : null
+  if (kw) {
+    const [sx, sy] = kw.startsWith('closest') ? near : far
+    if (!circle) return kw.endsWith('corner') ? [sx * Math.SQRT2, sy * Math.SQRT2] : [sx, sy]
+    const r = kw.endsWith('corner') ? Math.hypot(sx, sy) : kw.startsWith('closest') ? Math.min(sx, sy) : Math.max(sx, sy)
+    return [r, r]
+  }
+  const rx = parsePositionComponent(size![0], w)
+  return [rx, size![1] ? parsePositionComponent(size![1], h) : rx]
+}
+
+// What only resolves against the painted box: corner angles (45° multiples hold only for
+// squares), a radial gradient's center and ending shape, and px-positioned stops.
+export function resolveGradientBox(gradient: Gradient, w: number, h: number): Gradient {
+  if (w <= 0 || h <= 0) return { ...gradient, stops: fixupStopPositions(gradient.stops) }
+
+  if (gradient.type === 'linear' && gradient.corner) {
+    const a = Math.atan2(h, w) * 180 / Math.PI
+    const cornerAngle: Record<string, number> = {
+      'top right': a, 'bottom right': 180 - a, 'bottom left': 180 + a, 'top left': 360 - a,
+    }
+    gradient = { ...gradient, angle: cornerAngle[gradient.corner] ?? gradient.angle }
+  }
+
+  if (gradient.type === 'radial' && gradient.rx === undefined) {
+    const cx = parsePositionComponent(gradient.position?.[0], w)
+    const cy = parsePositionComponent(gradient.position?.[1], h)
+    const [rx, ry] = radialExtent(gradient.size, !!gradient.circle, cx, cy, w, h)
+    gradient = {
+      type: 'radial', cx: cx / w, cy: cy / h, rx: Math.max(rx, 0.01) / w, ry: Math.max(ry, 0.01) / h,
+      repeating: gradient.repeating, stops: gradient.stops,
+    }
+  }
+
+  if (gradient.stops.some(st => st.posPx !== undefined)) {
+    // the gradient ray: the line's length for linear, the horizontal radius for radial
+    const rad = gradient.type === 'linear' ? gradient.angle * Math.PI / 180 : 0
+    const linePt = gradient.type === 'linear'
+      ? Math.abs(w * Math.sin(rad)) + Math.abs(h * Math.cos(rad))
+      : (gradient.rx ?? 0.5) * w
+    if (linePt > 0) {
+      gradient = { ...gradient, stops: gradient.stops.map(st =>
+        st.posPx !== undefined
+          ? { color: st.color, position: (st.posPx / PX_PER_PT) / linePt }
+          : st
+      ) }
+    }
+  }
+
+  gradient = { ...gradient, stops: fixupStopPositions(gradient.stops) }
+
+  // repeating gradients tile their stops across [0, 1], a fraction of the gradient line
+  // (linear) or of the radius (radial) alike
+  if (gradient.repeating) {
+    gradient = { ...gradient, repeating: undefined, stops: tileStops(gradient.stops, true) }
+  }
+
+  return gradient
 }

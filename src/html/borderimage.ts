@@ -1,6 +1,7 @@
-import type { ImageCommand, ClipCommand, Gradient, ConicGradient } from '../types/index.js'
-import { PX_PER_PT, domRectToPt, paginateSpan, stackOpacity, type WalkerCtx } from './types.js'
-import { pxToPt, parseCSSGradient, parseCSSConicGradient } from './css.js'
+import type { ImageCommand } from '../types/index.js'
+import { PX_PER_PT, domRectToPt, paginateSpan, stackOpacity, stackBlend, type WalkerCtx } from './types.js'
+import { pxToPt, parseCSSGradient, parseCSSConicGradient, resolveGradientBox } from './css.js'
+import { canvasToPngBytes, fillConic, fillGradient, loadImage } from './canvaspaint.js'
 import { extractBgUrl } from './images.js'
 
 interface Sides { top: number; right: number; bottom: number; left: number }
@@ -62,52 +63,6 @@ function parseRepeat(v: string): [RepeatMode, RepeatMode] {
   return [h, w]
 }
 
-function loadImageElement(url: string): Promise<HTMLImageElement | null> {
-  return new Promise(resolve => {
-    const img = new Image()
-    img.onload  = () => resolve(img)
-    img.onerror = () => resolve(null)
-    img.src = url
-  })
-}
-
-// canvas's own linear/radial gradient primitives cover both — angle/stops
-// already parsed by the same CSS gradient parser the background path uses
-function paintGradientToCanvas(canvas: HTMLCanvasElement, g: Gradient): void {
-  const ctx = canvas.getContext('2d')!
-  const w = canvas.width, h = canvas.height
-  let grad: CanvasGradient
-  if (g.type === 'linear') {
-    const rad = g.angle * Math.PI / 180
-    const dx = Math.sin(rad), dy = -Math.cos(rad)
-    const half = Math.abs(w * dx) / 2 + Math.abs(h * dy) / 2
-    const cx = w / 2, cy = h / 2
-    grad = ctx.createLinearGradient(cx - dx * half, cy - dy * half, cx + dx * half, cy + dy * half)
-  } else {
-    const cx = (g.cx ?? 0.5) * w, cy = (g.cy ?? 0.5) * h
-    const r  = Math.hypot(Math.max(cx, w - cx), Math.max(cy, h - cy))
-    grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r)
-  }
-  for (const st of g.stops) {
-    const [r, gr, b, a] = st.color
-    grad.addColorStop(Math.min(1, Math.max(0, st.position)), `rgba(${r},${gr},${b},${a / 255})`)
-  }
-  ctx.fillStyle = grad
-  ctx.fillRect(0, 0, w, h)
-}
-
-function paintConicToCanvas(canvas: HTMLCanvasElement, cg: ConicGradient): void {
-  const ctx = canvas.getContext('2d')
-  if (!ctx || typeof ctx.createConicGradient !== 'function') return
-  const grad = ctx.createConicGradient((cg.fromDeg - 90) * Math.PI / 180, cg.cx * canvas.width, cg.cy * canvas.height)
-  for (const st of cg.stops) {
-    const [r, g, b, a] = st.color
-    grad.addColorStop(Math.min(1, Math.max(0, st.position)), `rgba(${r},${g},${b},${a / 255})`)
-  }
-  ctx.fillStyle = grad
-  ctx.fillRect(0, 0, canvas.width, canvas.height)
-}
-
 interface SourceCanvas { canvas: HTMLCanvasElement; w: number; h: number }
 
 // resolves border-image-source to a full offscreen canvas: an actual url()
@@ -117,7 +72,7 @@ interface SourceCanvas { canvas: HTMLCanvasElement; w: number; h: number }
 async function resolveSourceCanvas(source: string, boxWpx: number, boxHpx: number): Promise<SourceCanvas | null> {
   const url = extractBgUrl(source)
   if (url) {
-    const img = await loadImageElement(url)
+    const img = await loadImage(url)
     if (!img || !img.naturalWidth || !img.naturalHeight) return null
     const canvas = document.createElement('canvas')
     canvas.width = img.naturalWidth
@@ -130,9 +85,9 @@ async function resolveSourceCanvas(source: string, boxWpx: number, boxHpx: numbe
   const canvas = document.createElement('canvas')
   canvas.width = w; canvas.height = h
   const g = parseCSSGradient(source)
-  if (g) { paintGradientToCanvas(canvas, g); return { canvas, w, h } }
+  if (g) { fillGradient(canvas.getContext('2d')!, resolveGradientBox(g, w / PX_PER_PT, h / PX_PER_PT), w, h); return { canvas, w, h } }
   const cg = parseCSSConicGradient(source)
-  if (cg) { paintConicToCanvas(canvas, cg); return { canvas, w, h } }
+  if (cg) { fillConic(canvas.getContext('2d')!, cg, w, h, w / PX_PER_PT, h / PX_PER_PT); return { canvas, w, h } }
   return null
 }
 
@@ -143,13 +98,7 @@ function cropToPng(src: SourceCanvas, sx: number, sy: number, sw: number, sh: nu
   canvas.height = Math.max(1, Math.round(sh))
   const ctx = canvas.getContext('2d')!
   ctx.drawImage(src.canvas, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height)
-  const dataUrl = canvas.toDataURL('image/png')
-  const comma = dataUrl.indexOf(',')
-  if (comma < 0) return null
-  const bin = atob(dataUrl.slice(comma + 1))
-  const out = new Uint8Array(bin.length)
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
-  return out
+  return canvasToPngBytes(canvas)
 }
 
 // mirrors MAX_BG_TILES in images.ts — an author-controlled tiny tile size
@@ -166,15 +115,16 @@ function tilePositions(mode: RepeatMode, length: number, tileSize: number): { po
     const count = Math.min(MAX_BORDER_TILES, Math.max(1, Math.round(length / tileSize)))
     return { positions: Array.from({ length: count }, (_, i) => i * (length / count)), size: length / count }
   }
+  // space spreads the leftover around the whole tiles, ends included; none fit, none drawn
   if (mode === 'space') {
-    const count = Math.min(MAX_BORDER_TILES, Math.max(1, Math.floor(length / tileSize)))
-    if (count <= 1) return { positions: [(length - tileSize) / 2], size: tileSize }
-    const gap = (length - count * tileSize) / (count - 1)
-    return { positions: Array.from({ length: count }, (_, i) => i * (tileSize + gap)), size: tileSize }
+    const count = Math.min(MAX_BORDER_TILES, Math.floor(length / tileSize))
+    const gap = (length - count * tileSize) / (count + 1)
+    return { positions: Array.from({ length: count }, (_, i) => gap + i * (tileSize + gap)), size: tileSize }
   }
-  // repeat: tiles clipped to the edge rect, so a partial tile at the end is fine
-  const count = Math.min(MAX_BORDER_TILES, Math.max(1, Math.ceil(length / tileSize)))
-  return { positions: Array.from({ length: count }, (_, i) => i * tileSize), size: tileSize }
+  // repeat centers the tiling on the edge; the edge rect clips the partial tiles at both ends
+  const first = (length - tileSize) / 2 - Math.ceil((length - tileSize) / 2 / tileSize) * tileSize
+  const count = Math.min(MAX_BORDER_TILES, Math.ceil((length - first) / tileSize))
+  return { positions: Array.from({ length: count }, (_, i) => first + i * tileSize), size: tileSize }
 }
 
 export function hasBorderImage(s: CSSStyleDeclaration): boolean {
@@ -211,7 +161,11 @@ export async function emitBorderImage(el: Element, s: CSSStyleDeclaration, ctx: 
   const sT = slice.top, sR = slice.right, sB = slice.bottom, sL = slice.left
   const srcMidW = Math.max(0, src.w - sL - sR), srcMidH = Math.max(0, src.h - sT - sB)
 
-  interface Region { sx: number; sy: number; sw: number; sh: number; dx: number; dy: number; dw: number; dh: number; repeatX?: RepeatMode; repeatY?: RepeatMode }
+  // tileScaleX/Y: how much a tiled slice is scaled; an edge follows its own cross size
+  interface Region {
+    sx: number; sy: number; sw: number; sh: number; dx: number; dy: number; dw: number; dh: number
+    repeatX?: RepeatMode; repeatY?: RepeatMode; tileScaleX?: number; tileScaleY?: number
+  }
   const regions: Region[] = [
     { sx: 0, sy: 0, sw: sL, sh: sT, dx: X, dy: Y, dw: wl, dh: wt },
     { sx: src.w - sR, sy: 0, sw: sR, sh: sT, dx: X + W - wr, dy: Y, dw: wr, dh: wt },
@@ -223,7 +177,14 @@ export async function emitBorderImage(el: Element, s: CSSStyleDeclaration, ctx: 
     { sx: src.w - sR, sy: sT, sw: sR, sh: srcMidH, dx: X + W - wr, dy: Y + wt, dw: wr, dh: midH, repeatY: repeatV },
   ]
   if (slice.fill) {
-    regions.push({ sx: sL, sy: sT, sw: srcMidW, sh: srcMidH, dx: X + wl, dy: Y + wt, dw: midW, dh: midH, repeatX: repeatH, repeatY: repeatV })
+    // the middle scales like the top edge across and the left edge down (bottom and right
+    // when those are 0 or infinite, else unscaled), per CSS Backgrounds 3
+    const factor = (a: number, b: number, c: number, d: number) =>
+      Number.isFinite(a / b) && a / b > 0 ? a / b : Number.isFinite(c / d) && c / d > 0 ? c / d : 1
+    regions.push({
+      sx: sL, sy: sT, sw: srcMidW, sh: srcMidH, dx: X + wl, dy: Y + wt, dw: midW, dh: midH,
+      repeatX: repeatH, repeatY: repeatV, tileScaleX: factor(wt, sT, wb, sB), tileScaleY: factor(wl, sL, wr, sR),
+    })
   }
 
   const opacity = stackOpacity(ctx)
@@ -234,25 +195,25 @@ export async function emitBorderImage(el: Element, s: CSSStyleDeclaration, ctx: 
 
     // an edge slice tiles at its OWN aspect-corrected size along the repeat axis,
     // matching the fixed cross-axis size (the border width) exactly
-    const naturalTileW = r.repeatX ? r.sw * (r.dh / r.sh) : r.dw
-    const naturalTileH = r.repeatY ? r.sh * (r.dw / r.sw) : r.dh
+    const naturalTileW = r.repeatX ? r.sw * (r.tileScaleX ?? r.dh / r.sh) : r.dw
+    const naturalTileH = r.repeatY ? r.sh * (r.tileScaleY ?? r.dw / r.sw) : r.dh
 
     const tx = r.repeatX ? tilePositions(r.repeatX, r.dw, naturalTileW) : { positions: [0], size: r.dw }
     const ty = r.repeatY ? tilePositions(r.repeatY, r.dh, naturalTileH) : { positions: [0], size: r.dh }
 
     const needsTileClip = !!(r.repeatX || r.repeatY)
     for (const { page, y: boxLy } of paginateSpan(r.dy, r.dh, ctx.pageH)) {
-      if (needsTileClip) ctx.commands.push({ type: 'clip-push', page, x: r.dx, y: boxLy, w: r.dw, h: r.dh } as ClipCommand)
+      if (needsTileClip) ctx.commands.push({ type: 'clip-push', page, x: r.dx, y: boxLy, w: r.dw, h: r.dh })
       for (const px of tx.positions) {
         for (const py of ty.positions) {
           ctx.commands.push({
             type: 'image', page, src: png, format: 'png',
             x: r.dx + px, y: boxLy + py, w: tx.size, h: ty.size,
-            opacity,
+            opacity, blend: stackBlend(ctx),
           } as ImageCommand)
         }
       }
-      if (needsTileClip) ctx.commands.push({ type: 'clip-pop', page } as ClipCommand)
+      if (needsTileClip) ctx.commands.push({ type: 'clip-pop', page })
     }
   }
 }

@@ -2,8 +2,6 @@ import { initEngine, triggerDownload, safeName } from './engine.js'
 import { renderHTMLtoPDF } from './src/index.js'
 import type { PageSize, PDFSecurity, PDFMetadata, BookmarkEntry } from './src/types/index.js'
 
-let _ready: Promise<void> | null = null
-
 export type SecurityPreset = 'read-only' | 'printable' | 'fillable' | 'locked' | 'open'
 export type SecurityOption = SecurityPreset | PDFSecurity | null
 
@@ -15,6 +13,7 @@ export interface RenderExtras {
   footer?:      (page: number, totalPages: number) => string
   taggedPdf?:   boolean | undefined
   pdfA?:        boolean | undefined
+  pdfUA?:       boolean | undefined
 }
 
 // Escapes a string for safe interpolation into HTML text content or a
@@ -35,7 +34,7 @@ function randomOwnerPassword(): string {
 }
 
 function resolveSecurityOption(opt: SecurityOption | undefined): PDFSecurity | null | undefined {
-  if (opt === undefined || opt === null || typeof opt === 'object') return opt as PDFSecurity | null | undefined
+  if (opt === undefined || opt === null || typeof opt === 'object') return opt
   if (opt === 'open') return null
   const base: PDFSecurity = {
     userPassword:  '',
@@ -49,8 +48,7 @@ function resolveSecurityOption(opt: SecurityOption | undefined): PDFSecurity | n
 
 const pdf = {
   warmup(): Promise<void> {
-    if (!_ready) _ready = initEngine().then(() => undefined)
-    return _ready
+    return initEngine()
   },
 
   async render(html: string, size: PageSize = 'A4', security?: SecurityOption, extras: RenderExtras = {}): Promise<Uint8Array> {
@@ -62,6 +60,7 @@ const pdf = {
       footer:    extras.footer,
       taggedPdf: extras.taggedPdf,
       pdfA:      extras.pdfA,
+      pdfUA:     extras.pdfUA,
     })
   },
 
@@ -76,3 +75,6 @@ const pdf = {
 export default pdf
 export { previewHTML, renderHTMLtoPDF } from './src/index.js'
 export type { PageSize, PageConfig, PDFSecurity, PDFMetadata, BookmarkEntry } from './src/types/index.js'
+// Named explicitly because they appear in renderHTMLtoPDF's signature: a caller typing its
+// own options object needs them, and only what this file names reaches the bundled .d.ts.
+export type { FontBridgeMap, HTMLToPDFOptions } from './src/html/index.js'

@@ -24,11 +24,9 @@ class Name {
 // instanceof, which is what keeps a reference distinct from a number.
 class Ref {
   constructor(num, gen) { this.num = num; this.gen = gen }
-  get isRef() { return true }
 }
 class PdfStream {
   constructor(dict, raw) { this.dict = dict; this.raw = raw }
-  get isStream() { return true }
 }
 
 class Lexer {
@@ -42,8 +40,6 @@ class Lexer {
       } else return
     }
   }
-
-  peekByte() { return this.buf[this.pos] }
 
   // "12 0 obj" is three tokens; parse() would read the first as a number and
   // rewind, leaving the rest in the stream.
@@ -90,11 +86,8 @@ class Lexer {
         const p2 = this.pos
         const t2 = this.readToken()
         if (/^[0-9]+$/.test(t2)) {
-          this.skip()
-          const p3 = this.pos
           const t3 = this.readToken()
           if (t3 === 'R') return new Ref(parseInt(tok, 10), parseInt(t2, 10))
-          this.pos = p3
           this.pos = p2
         } else this.pos = save
       }
@@ -198,10 +191,6 @@ class Lexer {
   }
 }
 
-export { Name, Ref, PdfStream }
-
-// ---------------------------------------------------------------------------
-
 const num = v => (typeof v === 'number' ? v : 0)
 
 class Doc {
@@ -240,7 +229,7 @@ class Doc {
   }
 
   readXrefStream(stm) {
-    const data = decodeStream(stm, null)
+    const data = decodeStream(stm)
     const w = stm.dict.get('W').map(num)
     const size = num(stm.dict.get('Size'))
     const index = stm.dict.get('Index') ?? [0, size]
@@ -267,12 +256,10 @@ class Doc {
 
   setupCrypt(password) {
     const enc = this.resolve(this.trailer.get('Encrypt'))
-    const idArr = this.trailer.get('ID')
     const R = num(enc.get('R'))
     if (R !== 6) throw new Error(`pdfread: only revision 6 is supported, saw ${R}`)
     this.crypt = buildR6Key(enc, password)
     this.encryptRef = this.trailer.get('Encrypt')
-    void idArr
   }
 
   resolve(v) {
@@ -287,9 +274,8 @@ class Doc {
     if (this.offsets.has(objnum)) {
       const lex = new Lexer(this.buf, this.offsets.get(objnum))
       lex.skipObjHeader()
-      const gen = 0
       value = lex.parse()
-      if (this.crypt && !this.isEncryptDict(objnum)) value = this.decryptDeep(value, objnum, gen)
+      if (this.crypt && !this.isEncryptDict(objnum)) value = this.decryptDeep(value)
     } else if (this.inObjStm.has(objnum)) {
       const { container, index } = this.inObjStm.get(objnum)
       const entries = this.objStmEntries(container)
@@ -309,7 +295,7 @@ class Doc {
     if (this._objStmCache.has(container)) return this._objStmCache.get(container)
 
     const stm = this.get(container)
-    const data = decodeStream(stm, null)
+    const data = decodeStream(stm)
     const n = num(this.resolve(stm.dict.get('N')))
     const first = num(this.resolve(stm.dict.get('First')))
 
@@ -331,7 +317,7 @@ class Doc {
     return out
   }
 
-  decryptDeep(value, objnum, gen) {
+  decryptDeep(value) {
     const walk = v => {
       if (v && v.str !== undefined) return { str: aesDecrypt(this.crypt, v.str) }
       if (Array.isArray(v)) return v.map(walk)
@@ -346,14 +332,13 @@ class Doc {
       }
       return v
     }
-    void objnum; void gen
     return walk(value)
   }
 
-  stream(stm) { return decodeStream(stm, null) }
+  stream(stm) { return decodeStream(stm) }
 }
 
-function decodeStream(stm, _key) {
+function decodeStream(stm) {
   const filter = stm.dict.get('Filter')
   const names = filter instanceof Name ? [filter] : Array.isArray(filter) ? filter : []
   let data = stm.raw
@@ -364,7 +349,7 @@ function decodeStream(stm, _key) {
   return data
 }
 
-// --- AES-256 revision 6 -----------------------------------------------------
+// AES-256 revision 6
 // ISO 32000-2 algorithms 2.A and 2.B, using node's crypto for the primitives
 // so this stays an independent check of daepdf's own implementation.
 
@@ -413,7 +398,7 @@ function aesDecrypt(key, data) {
   return pad >= 1 && pad <= 16 ? out.subarray(0, out.length - pad) : out
 }
 
-// --- text ------------------------------------------------------------------
+// Text
 
 // Identity-H hex strings carry glyph ids; ToUnicode maps them back. Only the
 // bfchar and bfrange forms daepdf emits are handled.
@@ -449,10 +434,15 @@ function utf16beToString(hexStr) {
   return out
 }
 
-// --- public API -------------------------------------------------------------
+// Public API
 
 class Page {
   constructor(doc, dict) { this.doc = doc; this.dict = dict }
+
+  content() {
+    const contents = this.doc.resolve(this.dict.get('Contents'))
+    return contents instanceof PdfStream ? this.doc.stream(contents).toString('latin1') : ''
+  }
 
   // Concatenated text of the page, decoded through each font's ToUnicode.
   text() {
@@ -467,20 +457,28 @@ class Page {
     for (const [name, ref] of fonts) {
       const font = d.resolve(ref)
       if (!(font instanceof Map)) continue
-      const desc = d.resolve(font.get('DescendantFonts'))
       const tu = d.resolve(font.get('ToUnicode'))
       if (tu instanceof PdfStream) cmaps.set(name, parseToUnicode(d.stream(tu).toString('latin1')))
-      void desc
     }
 
     let current = null
     let out = ''
+    // marked-content spans: one carrying /ActualText stands in for the glyphs inside it
+    const spans = []
     // Tf selects the font; Tj and TJ carry the glyphs. Only the operators
-    // daepdf emits are recognised.
-    const re = /\/([A-Za-z0-9#+.-]+)\s+[\d.]+\s+Tf|<([0-9a-fA-F]*)>\s*Tj|\[((?:[^\]\\]|\\.)*)\]\s*TJ/g
+    // daepdf emits are recognized.
+    const re = /\/([A-Za-z0-9#+.-]+)\s+[\d.]+\s+Tf|<([0-9a-fA-F]*)>\s*Tj|\[((?:[^\]\\]|\\.)*)\]\s*TJ|\/\w+\s*<<(.*?)>>\s*BDC|\bEMC\b/g
     let m
     while ((m = re.exec(body)) !== null) {
       if (m[1] !== undefined) { current = cmaps.get(m[1]) ?? null; continue }
+      if (m[4] !== undefined) {
+        const actual = /\/ActualText\s*<([0-9a-fA-F]*)>/.exec(m[4])
+        if (actual && !spans.includes(true)) out += decodeTextString(Buffer.from(actual[1], 'hex'))
+        spans.push(!!actual)
+        continue
+      }
+      if (m[0] === 'EMC') { spans.pop(); continue }
+      if (spans.includes(true)) continue
       const hexes = m[2] !== undefined ? [m[2]] : [...m[3].matchAll(/<([0-9a-fA-F]*)>/g)].map(x => x[1])
       for (const h of hexes) {
         for (let i = 0; i + 4 <= h.length; i += 4) {
@@ -490,6 +488,32 @@ class Page {
       }
     }
     return out
+  }
+
+  // The decoded content of every form XObject the page reaches, nested ones included
+  forms() { return this.reach().forms }
+
+  // The dictionaries of the shadings those forms use
+  shadings() { return this.reach().shadings }
+
+  reach() {
+    const d = this.doc, forms = [], shadings = [], seen = new Set()
+    const walk = res => {
+      res = d.resolve(res)
+      for (const ref of (d.resolve(res?.get('Shading')) ?? new Map()).values()) {
+        const sh = d.resolve(ref)
+        shadings.push(sh instanceof PdfStream ? sh.dict : sh)
+      }
+      for (const ref of (d.resolve(res?.get('XObject')) ?? new Map()).values()) {
+        const x = d.resolve(ref)
+        if (!(x instanceof PdfStream) || seen.has(x) || d.resolve(x.dict.get('Subtype'))?.name !== 'Form') continue
+        seen.add(x)
+        forms.push(d.stream(x).toString('latin1'))
+        walk(x.dict.get('Resources'))
+      }
+    }
+    walk(this.dict.get('Resources'))
+    return { forms, shadings }
   }
 
   annotations() {
@@ -509,6 +533,12 @@ class Page {
         fieldName: d.resolve(a.get('T'))?.str ? decodeTextString(d.resolve(a.get('T')).str) : undefined,
         fieldValue: d.resolve(a.get('V'))?.str ? decodeTextString(d.resolve(a.get('V')).str) : undefined,
         fieldType: d.resolve(a.get('FT')) instanceof Name ? d.resolve(a.get('FT')).name : undefined,
+        fieldFlags: a.has('Ff') ? num(d.resolve(a.get('Ff'))) : undefined,
+        flags: a.has('F') ? num(d.resolve(a.get('F'))) : undefined,
+        fieldOptions: a.has('Opt') ? d.resolve(a.get('Opt')).map(o => {
+          const v = d.resolve(o)
+          return Array.isArray(v) ? v.map(x => decodeTextString(d.resolve(x).str)) : decodeTextString(v.str)
+        }) : undefined,
         rect,
       }
     }).filter(Boolean)
@@ -579,9 +609,14 @@ class Document {
     return walk(first)
   }
 
-  // Every object in the file, for tests that assert on raw structure.
-  rawObject(objnum) { return this.doc.get(objnum) }
-  trailerDict() { return this.doc.trailer }
+  // A catalog entry, resolved: text strings decoded, names as their name, dicts as Maps.
+  catalogEntry(key) {
+    const v = this.doc.resolve(this.root.get(key))
+    if (v?.str) return decodeTextString(v.str)
+    if (v instanceof Name) return v.name
+    return v
+  }
+
 }
 
 // PDF text strings are either UTF-16BE with a BOM or PDFDocEncoding.

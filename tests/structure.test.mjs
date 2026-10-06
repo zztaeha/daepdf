@@ -6,12 +6,12 @@ export default async function ({ test, eq, ok, load }) {
   const build = () => {
     const d = new PdfDoc(300, 300)
     d.set_fill_color(10, 20, 30)
-    d.rect(10, 10, 100, 50, 'F')
+    d.rect(10, 10, 100, 50)
     d.save_graphics_state()
     d.set_alpha(0.5)
-    d.rect(20, 20, 30, 30, 'F')
+    d.rect(20, 20, 30, 30)
     d.restore_graphics_state()
-    d.add_page()
+    d.set_page(2)
     d.line(0, 0, 100, 100)
     return d
   }
@@ -24,7 +24,6 @@ export default async function ({ test, eq, ok, load }) {
       `second output() differs in length: ${a.length} then ${b.length}`)
   })
 
-  test('the second output() is still a readable PDF', async () => {})
   {
     const d = build()
     d.output()
@@ -33,7 +32,7 @@ export default async function ({ test, eq, ok, load }) {
     try {
       pages = readPdf(second).numPages
     } catch (e) { err = e.message.split('\n')[0] }
-    test('second output() opens and has the right page count', () => {
+    test('the second output() is still a readable PDF', () => {
       ok(err === null, `the reader could not open it: ${err}`)
       eq(pages, 2, 'page count after a second output()')
     })
@@ -56,7 +55,6 @@ export default async function ({ test, eq, ok, load }) {
     ok(problems.length === 0, problems.join(' | '))
   })
 
-  test('q and Q are balanced in every content stream', async () => {})
   {
     const zlib = await import('node:zlib')
     const buf = Buffer.from(build().output())

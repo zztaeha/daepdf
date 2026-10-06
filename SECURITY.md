@@ -8,7 +8,7 @@ included, do not receive them.
 ## Reporting a Vulnerability
 
 Please report security vulnerabilities privately through GitHub's
-[private vulnerability reporting](https://github.com/silly-tae/daepdf/security/advisories/new)
+[private vulnerability reporting](https://github.com/zztaeha/daepdf/security/advisories/new)
 (Security tab → "Report a vulnerability") rather than opening a public issue.
 
 This is a solo-maintained project. I'll acknowledge reports as quickly as I can,
@@ -26,12 +26,14 @@ here can actually reach:
 - **The only network requests are the ones your template asks for** – fonts named
   in `@font-face`, images referenced by `<img>`/`background-image` – plus the
   engine's own `.wasm`. No telemetry, no analytics, no other outbound calls.
-- **The rendering engine ships as a prebuilt binary.** `src/daepl/wasm/daepl.wasm`
-  is compiled from daepl, a Rust crate derived from
-  [daegun](https://github.com/silly-tae/daegun), and only the binary and its
-  loader live in this repository. It cannot be rebuilt from this source tree
-  alone, so anyone auditing the engine is auditing bytes rather than code. The
-  crate is `no_std` and `forbid(unsafe_code)`.
+- **The rendering engine is built from this repository.**
+  `src/daegun/wasm/daegun.wasm` is compiled from `engine/`, a small Rust wrapper
+  around [daegun](https://github.com/zztaeha/daegun) 1.2.0 from crates.io,
+  pinned by `engine/Cargo.lock` (with its checksum) and `engine/rust-toolchain.toml`.
+  `engine/build.sh` rebuilds it, with binaryen's `wasm-opt` 132; the build is
+  reproducible (the same bytes from any checkout path), so the shipped binary can
+  be checked against its source. daegun has no dependencies and forbids unsafe
+  code outside its C API, which the wrapper does not use.
 
 ## Scope
 
@@ -66,7 +68,7 @@ Things that count as a security issue here:
 
 - Issues that only reproduce with a template author's own unescaped interpolation
   of user input (see the README's
-  [Escaping HTML](https://github.com/silly-tae/daepdf#escaping-html) section) –
+  [Escaping HTML](https://github.com/zztaeha/daepdf#escaping-html) section) –
   that's the caller's responsibility, not daepdf's.
 - **PDF permission flags being ignored by a viewer.** Permissions (print, copy,
   modify) are bound into the encryption, but nothing forces a reader to honor

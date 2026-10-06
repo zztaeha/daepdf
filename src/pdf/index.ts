@@ -1,25 +1,39 @@
 import { measure_string_width } from '../../engine.js'
 import { PdfDoc } from '../pdf_doc/index.js'
-import type {
-  DrawCommand, TextCommand, RectCommand, LineCommand, LinkCommand,
-  ClipCommand, ImageCommand, RawImageCommand, TransformCommand, FieldCommand, PathCommand,
-  DocDefinition, AnchorEntry, StructNode,
-} from '../types/index.js'
+import type { DrawCommand, DocDefinition, AnchorEntry, StructNode, Gradient } from '../types/index.js'
 import type { RawImage } from '../images/decode.js'
-import { resolvePageSize, resolveRadius, anyRadius } from '../types/index.js'
+import { resolvePageSize, resolveRadius, anyRadius, cssToPdfMatrix, LINK_SCHEMES } from '../types/index.js'
 import { emitShadows } from './shadows.js'
-import { applyMetadata, applyBookmarks, applySecurity, resolveSecurityConfig, applyStructTree, applyPdfA } from './finalize.js'
+import { applyMetadata, applyBookmarks, applySecurity, resolveSecurityConfig, applyStructTree, applyPdfA, applyPdfUA } from './finalize.js'
 
 export { rasterizeSVGs } from './svg.js'
+
+export const PDFA_SECURITY_ERROR = '[daepdf] PDF/A does not allow encryption – pass either `pdfA` or `security`, not both.'
+export const PDFUA_TITLE_ERROR = '[daepdf] PDF/UA requires a document title – pass `metadata.title` with `pdfUA`.'
+
+// the commands that put marks on the page, which tagged output tags or marks as artifacts
+const PAINTS = new Set<DrawCommand['type']>(['text', 'rect', 'line', 'path', 'image', 'raw-image'])
+
+function addGradient(doc: PdfDoc, g: Gradient): number {
+  const stops = new Float64Array(g.stops.flatMap(s => [s.position, s.color[0], s.color[1], s.color[2], s.color[3]]))
+  if (g.type === 'linear') return doc.add_gradient(0, g.angle, stops, 0.5, 0.5, 0.5, 0.5, undefined, undefined, !!g.straightAlpha)
+  const cx = g.cx ?? 0.5, cy = g.cy ?? 0.5
+  return doc.add_gradient(1, 0, stops, cx, cy, g.fx ?? cx, g.fy ?? cy, g.rx, g.ry, !!g.straightAlpha)
+}
 
 export function applyToPDF(
   commands:    DrawCommand[],
   def:         DocDefinition,
   anchors?:    Map<string, AnchorEntry>,
   structRoot?: StructNode,
+  pageCount?:  number,
 ): Uint8Array {
+  if (def.pdfUA && !def.metadata?.title) throw new Error(PDFUA_TITLE_ERROR)
   const size = resolvePageSize(def.config.size, def.config.orientation)
   const doc  = new PdfDoc(size.width, size.height)
+  // before drawing: PDF/A changes how text is written (no .notdef glyphs)
+  if (def.pdfA) applyPdfA(doc, def.metadata)
+  if (def.pdfUA) applyPdfUA(doc, def.metadata)
 
   let currentPage = 1
   const imageCache = new Map<Uint8Array | RawImage, number>()
@@ -34,14 +48,8 @@ export function applyToPDF(
   // content stream it writes to (per page, per q/Q region). A second cache at
   // this level can only disagree with the stream — it already did once, letting
   // text render in the previous box's fill color.
-  for (const cmd of commands) {
-    if (cmd.page !== currentPage) {
-      doc.set_page(cmd.page)
-      currentPage = cmd.page
-    }
-
-    if (cmd.type === 'text') {
-      const c = cmd as TextCommand
+  const paint = (c: DrawCommand): void => {
+    if (c.type === 'text') {
       const tagged = c.mcid !== undefined && c.structTag !== undefined
       if (tagged) doc.begin_marked_content(c.structTag!, c.mcid!)
       doc.set_font(c.font, c.style, c.weight)
@@ -53,47 +61,42 @@ export function applyToPDF(
       if (hasTextGState) doc.set_alpha(c.opacity ?? 1, c.blend)
       const stroke = c.stroke ? { color: c.stroke, width: c.strokeWidth ?? 0, strokeOnly: !!c.strokeOnly } : undefined
       if (c.vertical) {
-        // align/direction/measure_string_width are horizontal-layout concepts
-        // that don't apply to a vertical column — x/y are already the
-        // column's own anchor, computed by the caller (walk.ts/emit.ts)
+        // the RTL shift below is horizontal layout; a vertical column's x/y
+        // are already its own anchor, computed by the caller (walk.ts/emit.ts)
         doc.text_vertical(c.text, c.x, c.y, stroke)
       } else {
         let px = c.x
-        if (c.align !== 'left' || c.direction === 'rtl') {
-          const w = measure_string_width(c.text, c.font, c.style, c.weight, 0, c.size)
-          if (c.align === 'center') px = c.x + c.maxWidth / 2 - w / 2
-          else if (c.align === 'right') px = c.x + c.maxWidth - w
-          // RTL with left alignment: shift to right edge so text reads right-to-left from maxWidth
-          else if (c.direction === 'rtl') px = c.x + c.maxWidth - w
+        if (c.direction === 'rtl') {
+          // RTL text ends at the right edge; Tc and word spacing both widen the run
+          const w = measure_string_width(c.text, c.font, c.style, c.weight, 0, c.size) +
+            (c.letterSpacing ?? 0) * [...c.text].length + (c.wordSpacing ?? 0) * (c.text.match(/[  ]/g)?.length ?? 0)
+          px = c.x + c.maxWidth - w
         }
-        doc.text(c.text, px, c.y, 'alphabetic', stroke)
+        doc.text(c.text, px, c.y, 'alphabetic', stroke, c.skew, c.direction)
       }
       if (c.letterSpacing) doc.set_char_space(0)
       if (c.wordSpacing) doc.set_word_spacing(0)
       if (hasTextGState) doc.set_alpha(1.0)
       if (tagged) doc.end_marked_content()
 
-    } else if (cmd.type === 'link') {
-      const c = cmd as LinkCommand
+    } else if (c.type === 'link') {
       if (c.href.startsWith('#')) {
         // fragments arrive percent-encoded ("#foo%20bar") but ids are raw
         let frag = c.href.slice(1)
         try { frag = decodeURIComponent(frag) } catch { /* keep raw */ }
         const dest = anchors?.get(frag) ?? anchors?.get(c.href.slice(1))
-        if (dest) doc.add_goto_annotation(c.x, c.y, c.w, c.h, dest.page, dest.y)
+        if (dest) doc.add_goto_annotation(c.x, c.y, c.w, c.h, dest.page, dest.y, c.structAnnot, c.contents)
       } else {
-        const lower = c.href.toLowerCase().trimStart()
-        if (lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('mailto:')) {
+        if (LINK_SCHEMES.test(c.href.trimStart())) {
           // /URI must be ASCII — unencoded unicode or spaces break the link in
           // some viewers (encodeURI leaves existing %-escapes intact)
           let uri = c.href
           try { uri = encodeURI(c.href) } catch { /* malformed input stays raw */ }
-          doc.add_link_annotation(c.x, c.y, c.w, c.h, uri)
+          doc.add_link_annotation(c.x, c.y, c.w, c.h, uri, c.structAnnot, c.contents)
         }
       }
 
-    } else if (cmd.type === 'rect') {
-      const c = cmd as RectCommand
+    } else if (c.type === 'rect') {
       // corners resolve to zero pairs when there is no radius — every PdfDoc
       // geometry method treats a {0,0} corner as square, so one resolved shape
       // serves the rounded and square paths alike
@@ -104,24 +107,13 @@ export function applyToPDF(
 
       // Outer shadows — before fill so box paints on top
       if (outerShadows.length) {
-        emitShadows(doc, outerShadows, c.x, c.y, c.w, c.h, rr)
+        emitShadows(doc, outerShadows, c.x, c.y, c.w, c.h, rr, c.opacity ?? 1, c.blend)
       }
 
       const hasRectGState = (c.opacity !== undefined && c.opacity < 1) || !!c.blend
       if (hasRectGState) doc.set_alpha(c.opacity ?? 1, c.blend)
       if (c.gradient) {
-        const g = c.gradient
-        const stopsFlat = new Float64Array(g.stops.flatMap(s => [s.position, s.color[0], s.color[1], s.color[2], s.color[3]]))
-        const isRadial = g.type === 'radial'
-        const gradId = doc.add_gradient(
-          isRadial ? 1 : 0,
-          g.type === 'linear' ? (g.angle ?? 0) : 0,
-          stopsFlat,
-          isRadial ? (g.cx ?? 0.5) : 0.5,
-          isRadial ? (g.cy ?? 0.5) : 0.5,
-          isRadial ? (g.fx ?? g.cx ?? 0.5) : 0.5,
-          isRadial ? (g.fy ?? g.cy ?? 0.5) : 0.5,
-        )
+        const gradId = addGradient(doc, c.gradient)
         if (hasRadius) {
           doc.fill_with_gradient_rounded(gradId, c.x, c.y, c.w, c.h, rr.tl, rr.tr, rr.br, rr.bl)
         } else {
@@ -129,8 +121,8 @@ export function applyToPDF(
         }
       } else if (c.fill) {
         doc.set_fill_color(c.fill[0], c.fill[1], c.fill[2])
-        if (hasRadius) doc.rounded_rect(c.x, c.y, c.w, c.h, rr.tl, rr.tr, rr.br, rr.bl, 'F')
-        else           doc.rect(c.x, c.y, c.w, c.h, 'F')
+        if (hasRadius) doc.rounded_rect(c.x, c.y, c.w, c.h, rr.tl, rr.tr, rr.br, rr.bl)
+        else           doc.rect(c.x, c.y, c.w, c.h)
       }
 
       if (c.stroke) {
@@ -153,13 +145,12 @@ export function applyToPDF(
 
       // Inset shadows — after fill so the shadow layers paint over the box background
       if (insetShadows.length) {
-        emitShadows(doc, insetShadows, c.x, c.y, c.w, c.h, rr)
+        emitShadows(doc, insetShadows, c.x, c.y, c.w, c.h, rr, c.opacity ?? 1, c.blend)
       }
 
       if (hasRectGState) doc.set_alpha(1.0)
 
-    } else if (cmd.type === 'line') {
-      const c = cmd as LineCommand
+    } else if (c.type === 'line') {
       const hasLineGState = (c.opacity !== undefined && c.opacity < 1) || !!c.blend
       if (hasLineGState) doc.set_alpha(c.opacity ?? 1, c.blend)
       doc.set_draw_color(c.color[0], c.color[1], c.color[2])
@@ -167,13 +158,13 @@ export function applyToPDF(
       // dash/dot lengths scale with the line width like browser borders do — a fixed
       // pattern turns thick dashed borders into near-square blobs
       if (c.lineStyle === 'dashed') {
-        doc.set_line_dash([Math.max(2, c.width * 3), Math.max(1.5, c.width * 2)], 0)
+        doc.set_line_dash([Math.max(2, c.width * 3), Math.max(1.5, c.width * 2)])
         doc.line(c.x1, c.y1, c.x2, c.y2)
-        doc.set_line_dash([], 0)
+        doc.set_line_dash([])
       } else if (c.lineStyle === 'dotted') {
-        doc.set_line_dash([Math.max(0.5, c.width), Math.max(1, c.width * 1.5)], 0)
+        doc.set_line_dash([Math.max(0.5, c.width), Math.max(1, c.width * 1.5)])
         doc.line(c.x1, c.y1, c.x2, c.y2)
-        doc.set_line_dash([], 0)
+        doc.set_line_dash([])
       } else if (c.lineStyle === 'wavy') {
         doc.wavy_line(c.x1, c.y1, c.x2, c.y2, Math.max(0.6, c.width * 1.2), Math.max(3, c.width * 4))
       } else {
@@ -181,8 +172,7 @@ export function applyToPDF(
       }
       if (hasLineGState) doc.set_alpha(1.0)
 
-    } else if (cmd.type === 'clip-push') {
-      const c = cmd as ClipCommand
+    } else if (c.type === 'clip-push') {
       doc.save_graphics_state()
       if (c.path) {
         doc.set_clip_path(c.path, !!c.evenOdd)
@@ -195,27 +185,26 @@ export function applyToPDF(
         }
       }
 
-    } else if (cmd.type === 'clip-pop') {
+    } else if (c.type === 'clip-pop') {
       doc.restore_graphics_state()
 
-    } else if (cmd.type === 'transform-push') {
-      const c = cmd as TransformCommand
+    } else if (c.type === 'transform-push') {
       doc.save_graphics_state()
-      if (c.matrix) doc.set_transform(c.matrix)
+      const matrix = c.css && c.origin ? cssToPdfMatrix(c.css, c.origin[0], c.origin[1], size.height) : c.matrix
+      if (matrix) doc.set_transform(matrix)
 
-    } else if (cmd.type === 'transform-pop') {
+    } else if (c.type === 'transform-pop') {
       doc.restore_graphics_state()
 
-    } else if (cmd.type === 'image') {
-      const c = cmd as ImageCommand
-      if (c.format === 'svg') continue  // rasterizeSVGs() was not called before applyToPDF()
-      if (c.w < 0.01 || c.h < 0.01) continue  // degenerate cm matrix; some viewers reject it
+    } else if (c.type === 'image') {
+      if (c.format === 'svg') return  // rasterizeSVGs() was not called before applyToPDF()
+      if (c.w < 0.01 || c.h < 0.01) return  // degenerate cm matrix; some viewers reject it
       let imageId = imageCache.get(c.src)
       if (imageId === undefined) {
         imageId = doc.embed_image(c.src)
         if (imageId !== 0xFFFFFFFF) imageCache.set(c.src, imageId)
       }
-      if (imageId !== undefined && imageId !== 0xFFFFFFFF) {
+      if (imageId !== 0xFFFFFFFF) {
         const tagged = c.mcid !== undefined && c.structTag !== undefined
         if (tagged) doc.begin_marked_content(c.structTag!, c.mcid!)
         const hasGState = (c.opacity !== undefined && c.opacity < 1) || !!c.blend
@@ -225,15 +214,14 @@ export function applyToPDF(
         if (tagged) doc.end_marked_content()
       }
 
-    } else if (cmd.type === 'raw-image') {
-      const c = cmd as RawImageCommand
-      if (c.w < 0.01 || c.h < 0.01) continue
+    } else if (c.type === 'raw-image') {
+      if (c.w < 0.01 || c.h < 0.01) return
       let imageId = imageCache.get(c.raw)
       if (imageId === undefined) {
         imageId = doc.embed_raw_image(c.raw)
         if (imageId !== 0xFFFFFFFF) imageCache.set(c.raw, imageId)
       }
-      if (imageId !== undefined && imageId !== 0xFFFFFFFF) {
+      if (imageId !== 0xFFFFFFFF) {
         const tagged = c.mcid !== undefined && c.structTag !== undefined
         if (tagged) doc.begin_marked_content(c.structTag!, c.mcid!)
         const hasGState = (c.opacity !== undefined && c.opacity < 1) || !!c.blend
@@ -243,32 +231,22 @@ export function applyToPDF(
         if (tagged) doc.end_marked_content()
       }
 
-    } else if (cmd.type === 'field') {
-      const c = cmd as FieldCommand
+    } else if (c.type === 'field') {
       doc.add_form_field(
         c.x, c.y, c.w, c.h, c.fieldType, c.name,
         c.font, c.style, c.weight, c.size, c.color,
         c.value, c.checked, c.options,
+        { flags: c.flags, display: c.display, exportValues: c.exportValues, structAnnot: c.structAnnot, tooltip: c.tooltip },
       )
 
-    } else if (cmd.type === 'path') {
-      const c = cmd as PathCommand
+    } else if (c.type === 'path') {
+      const tagged = c.mcid !== undefined && c.structTag !== undefined
+      if (tagged) doc.begin_marked_content(c.structTag!, c.mcid!)
       const hasPathGState = (c.opacity !== undefined && c.opacity < 1) || !!c.blend
       if (hasPathGState) doc.set_alpha(c.opacity ?? 1, c.blend)
       let gradientFill: { gradientId: number; x: number; y: number; w: number; h: number } | undefined
       if (c.gradient && c.gradientBox) {
-        const g = c.gradient
-        const stopsFlat = new Float64Array(g.stops.flatMap(s => [s.position, s.color[0], s.color[1], s.color[2], s.color[3]]))
-        const isRadial = g.type === 'radial'
-        const gradId = doc.add_gradient(
-          isRadial ? 1 : 0,
-          g.type === 'linear' ? (g.angle ?? 0) : 0,
-          stopsFlat,
-          isRadial ? (g.cx ?? 0.5) : 0.5,
-          isRadial ? (g.cy ?? 0.5) : 0.5,
-          isRadial ? (g.fx ?? g.cx ?? 0.5) : 0.5,
-          isRadial ? (g.fy ?? g.cy ?? 0.5) : 0.5,
-        )
+        const gradId = addGradient(doc, c.gradient)
         gradientFill = { gradientId: gradId, x: c.gradientBox.x, y: c.gradientBox.y, w: c.gradientBox.w, h: c.gradientBox.h }
       }
       const stroke = c.stroke
@@ -276,15 +254,41 @@ export function applyToPDF(
         : undefined
       doc.draw_path(c.ops, !!c.evenOdd, c.fill, gradientFill, stroke)
       if (hasPathGState) doc.set_alpha(1.0)
+      if (tagged) doc.end_marked_content()
     }
   }
+
+  // Tagged output: drawing outside the structure tree (borders, backgrounds, decoration,
+  // replicated fixed content) is an artifact, and a header/footer group is a pagination one
+  let paginationDepth = 0
+  for (const cmd of commands) {
+    if (cmd.page !== currentPage) {
+      doc.set_page(cmd.page)
+      currentPage = cmd.page
+    }
+    if (cmd.type === 'artifact-push' || cmd.type === 'artifact-pop') {
+      if (!structRoot) continue
+      if (cmd.type === 'artifact-push') { doc.begin_artifact(cmd.subtype); paginationDepth++ }
+      else { doc.end_marked_content(); paginationDepth-- }
+      continue
+    }
+    const decoration = !!structRoot && paginationDepth === 0 && PAINTS.has(cmd.type) && (cmd as { mcid?: number }).mcid === undefined
+    if (decoration) doc.begin_artifact()
+    paint(cmd)
+    if (decoration) doc.end_marked_content()
+  }
+
+  // a page only exists once something is drawn on it, but the layout's trailing pages
+  // (blank space, bottom padding) are pages too, in the preview and in print
+  if (pageCount) doc.set_page(pageCount)
 
   if (def.metadata)  applyMetadata(doc, def.metadata)
   if (def.bookmarks) applyBookmarks(doc, def.bookmarks)
   if (structRoot)    applyStructTree(doc, structRoot)
-  if (def.pdfA)      applyPdfA(doc, def.metadata)
 
-  const sec = resolveSecurityConfig(def.security)
+  // PDF/A forbids encryption: the default security is skipped and an explicit one rejected
+  if (def.pdfA && def.security) throw new Error(PDFA_SECURITY_ERROR)
+  const sec = def.pdfA ? null : resolveSecurityConfig(def.security)
   if (sec) applySecurity(doc, sec)
 
   return doc.output()

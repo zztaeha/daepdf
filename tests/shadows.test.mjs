@@ -25,7 +25,7 @@ export default async function ({ test, eq, ok, load }) {
   const draw = shadows => {
     const d = new PdfDoc(300, 300)
     emitShadows(d, shadows, 50, 50, 100, 60, square)
-    d.rect(50, 50, 100, 60, 'F')
+    d.rect(50, 50, 100, 60)
     return d
   }
 
@@ -35,6 +35,14 @@ export default async function ({ test, eq, ok, load }) {
     const alphas = alphasIn(d.output()).filter(a => a < 1)
     ok(alphas.length === 0,
       `a zero-blur shadow should be opaque, but was painted at ${alphas.join(', ')}`)
+  })
+
+  test('the element\'s opacity and blend mode apply to its shadow', () => {
+    const d = new PdfDoc(300, 300)
+    emitShadows(d, [{ x: 0, y: 0, blur: 0, spread: 10, color: [0, 0, 0, 255], inset: false }], 50, 50, 100, 60, square, 0.3, 'Multiply')
+    const out = Buffer.from(d.output()).toString('latin1')
+    eq(alphasIn(d.output()).filter(a => a < 1).join(), '0.3')
+    ok(/\/BM \/Multiply/.test(out), 'no Multiply blend on the shadow')
   })
 
   test('a blurred shadow still emits layers', () => {

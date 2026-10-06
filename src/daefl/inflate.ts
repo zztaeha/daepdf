@@ -268,13 +268,10 @@ function readDynamicTables(br: BitReader): [Huff, Huff] {
 }
 
 // `out`, when given, is both the destination and a hard size limit.
-// `sizeHint` only sizes the initial buffer when growing is allowed.
 // The end offset is reported because index.ts needs it to find the adler32.
-export function inflateRawWithEnd(
-  src: Uint8Array, out?: Uint8Array, sizeHint = 0,
-): { bytes: Uint8Array; end: number } {
+export function inflateRawWithEnd(src: Uint8Array, out?: Uint8Array): { bytes: Uint8Array; end: number } {
   const br = new BitReader(src)
-  const sink = new Sink(out, sizeHint || src.length * 4)
+  const sink = new Sink(out, src.length * 4)
 
   for (;;) {
     const final = br.bits(1)
@@ -311,5 +308,5 @@ export function inflateRawWithEnd(
   return { bytes: sink.result(), end: br.offset }
 }
 
-export const inflateRaw = (src: Uint8Array, out?: Uint8Array, sizeHint = 0): Uint8Array =>
-  inflateRawWithEnd(src, out, sizeHint).bytes
+export const inflateRaw = (src: Uint8Array, out?: Uint8Array): Uint8Array =>
+  inflateRawWithEnd(src, out).bytes

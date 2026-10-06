@@ -1,4 +1,6 @@
+import type { Affine } from '../types/affine.js'
 import type { StructNode } from '../types/index.js'
+import type { ColrResources } from './colr.js'
 
 export interface DocFont {
   id:              string
@@ -11,7 +13,6 @@ export interface DocFont {
   // as f + i), hence the array
   glyphToUnicode:  Map<number, number[]>
   objectNumber:    number
-  isAlreadyPutted: boolean
   // A4 (vertical writing modes): the SAME embedded glyph subset backs both
   // orientations — only the CIDFont's width array and the Type0 wrapper's
   // /Encoding differ (/W + Identity-H vs /W2+/DW2 + Identity-V) — so a
@@ -32,6 +33,7 @@ export interface EmbedImage {
   decodeInvert: boolean
   orientation:  number
   objectNumber: number
+  icc?:         Uint8Array | null | undefined
 }
 
 // V5/R6 (AES-256) standard security handler fields — see crypto_r6.ts
@@ -54,6 +56,9 @@ export interface GradDef {
   // for every non-SVG (CSS) gradient and every SVG one that doesn't use fx/fy
   fx:       number
   fy:       number
+  // ending ellipse radii as fractions of the filled box; absent, the farthest-corner circle
+  rx?:      number | undefined
+  ry?:      number | undefined
   // [position, r, g, b, a] — all 0-1 normalized
   stops:    [number, number, number, number, number][]
 }
@@ -64,6 +69,8 @@ export interface ShadPat {
   x: number; y: number; w: number; h: number
   pageH:   number
   objId:   number
+  // the CTM where it's used: a pattern lives in the page's default space, which cm doesn't move
+  ctm:     Affine
 }
 
 // registered when a gradient has any stop with alpha < 1 — PDF shading
@@ -101,8 +108,15 @@ export interface PageAnnot {
   fieldValue?:   string | undefined
   fieldChecked?: boolean | undefined
   fieldOptions?: string[] | undefined
+  fieldExportValues?: string[] | undefined
+  fieldFlags?:   number | undefined
   fieldApOn?:    string
   fieldApOff?:   string | undefined
+  // D3 (tagged PDF): the structure tree's key for this annotation (an AnnotRef)
+  structAnnot?:  number | undefined
+  // accessible descriptions for tagged output: a link's /Contents, a field's /TU
+  contents?:     string | undefined
+  tooltip?:      string | undefined
 }
 
 export interface ObjStmItem {
@@ -122,6 +136,7 @@ export interface InternalCtx {
   shadPats:          ShadPat[]
   gradSoftMasks:     GradSoftMask[]
   extGStates:        { alpha: number; blend: string }[]
+  colrRes:           ColrResources
   allPageBufs:       string[][]
   pageAnnots:        PageAnnot[][]
   pageObjIds:        number[]
@@ -139,12 +154,16 @@ export interface InternalCtx {
   formatH:           number
   structRoot:        StructNode | undefined
   pdfA:              boolean
+  pdfUA:             boolean
+  // the document language for the XMP packet (PDF/A, PDF/UA)
   pdfaLang:          string | undefined
   // D1 (AcroForm): filled in by build_pages.ts's putPages as it allocates
   // each field's merged Widget/Field object id, read by build_catalog.ts's
   // putCatalog for /AcroForm /Fields — same "producer writes, consumer
   // reads after" pattern as pageObjIds itself
   formFieldObjIds:   number[]
+  // tagged annotations by AnnotRef key: the object and its /StructParent, set by putPages
+  annotStructs:      Map<number, { oid: number; key: number }>
 
   write(s: string): void
   writeBytes(b: Uint8Array): void
@@ -152,7 +171,7 @@ export interface InternalCtx {
   outBytes(b: Uint8Array): void
   newObject(): number
   newObjectDeferred(): number
-  newObjectDeferredBegin(oid: number, doOutput: boolean): void
+  newObjectDeferredBegin(oid: number): void
   queueForObjStm(content: string): number
   beginCapture(): void
   endCapture(): string

@@ -7,23 +7,27 @@
 import type { DrawCommand } from '../types/index.js'
 import { PX_PER_PT, type FontBridgeMap, type WalkerCtx } from './types.js'
 import { buildRegisteredFontMap } from './fonts.js'
-import { walkChildren } from './walk.js'
+import { paintStackingContext, walkChildren } from './walk.js'
 import { emitBox } from './emit.js'
+import { resolveBgImages } from './images.js'
 import { parseSafeHTML, safeInjectParsed, createHiddenContainer, autoRegisterFonts, injectWordBreaks, nextScopeId } from './prep.js'
+import { waitForLayout } from './frame.js'
 
 export type PageChromeFn = (page: number, totalPages: number) => string
 
 async function renderChromeInto(
-  fn: PageChromeFn, page: number, totalPages: number, pageWidthPt: number,
+  fn: PageChromeFn, page: number, totalPages: number, pageWidthPt: number, doc: Document,
 ): Promise<HTMLDivElement> {
   const html      = fn(page, totalPages)
   const scopeId   = nextScopeId()
   const parsed    = parseSafeHTML(html, scopeId)
-  const styleText = Array.from(parsed.querySelectorAll('style')).map(s => s.textContent ?? '').join('\n')
+  const styleText = Array.from(parsed.querySelectorAll('style')).map(s => s.textContent).join('\n')
   await autoRegisterFonts(styleText)
-  const container = createHiddenContainer(pageWidthPt)
+  const container = createHiddenContainer(doc, pageWidthPt)
   safeInjectParsed(parsed, container, scopeId)
   injectWordBreaks(container)
+  // the frame is new per export: its fonts and images may still be loading on first use
+  await waitForLayout(container)
   return container
 }
 
@@ -33,12 +37,12 @@ async function renderChromeInto(
 // count differences between e.g. "Page 1 of 1" and "Page 10 of 100"
 // essentially never change a template's own wrapped line height, so a
 // single representative render (page=1, totalPages=1) is enough.
-export async function measureChromeHeight(fn: PageChromeFn, pageWidthPt: number): Promise<number> {
-  const container = await renderChromeInto(fn, 1, 1, pageWidthPt)
+export async function measureChromeHeight(fn: PageChromeFn, pageWidthPt: number, doc: Document): Promise<number> {
+  const container = await renderChromeInto(fn, 1, 1, pageWidthPt, doc)
   try {
     return container.scrollHeight / PX_PER_PT
   } finally {
-    document.body.removeChild(container)
+    container.remove()
   }
 }
 
@@ -53,9 +57,9 @@ export async function measureChromeHeight(fn: PageChromeFn, pageWidthPt: number)
 // bespoke coordinate system just for this.
 export async function captureChrome(
   fn: PageChromeFn, page: number, totalPages: number,
-  pageWidthPt: number, bandHeightPt: number, fonts: FontBridgeMap,
+  pageWidthPt: number, bandHeightPt: number, fonts: FontBridgeMap, doc: Document,
 ): Promise<DrawCommand[]> {
-  const container = await renderChromeInto(fn, page, totalPages, pageWidthPt)
+  const container = await renderChromeInto(fn, page, totalPages, pageWidthPt, doc)
   try {
     const ctx: WalkerCtx = {
       containerRect:   container.getBoundingClientRect(),
@@ -69,13 +73,15 @@ export async function captureChrome(
       blendStack:      [],
       counters:        new Map(),
       fieldCounter:    { n: 0 },
+      baselineOffsets: new Map(),
+      clampBoxes:      new Map(),
     }
     const rootStyle = getComputedStyle(container)
-    emitBox(container, rootStyle, ctx)
-    await walkChildren(container, rootStyle, ctx)
+    emitBox(container, rootStyle, ctx, await resolveBgImages(rootStyle))
+    await paintStackingContext(ctx, () => walkChildren(container, rootStyle, ctx))
     for (const cmd of ctx.commands) cmd.page = 1
     return ctx.commands
   } finally {
-    document.body.removeChild(container)
+    container.remove()
   }
 }

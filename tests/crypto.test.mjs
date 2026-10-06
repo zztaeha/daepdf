@@ -1,5 +1,6 @@
 import { sha256, sha384, sha512 } from '../src/pdf_doc/sha2.ts'
 import { aesCbcEncrypt, aesEcbEncryptBlock } from '../src/pdf_doc/aes.ts'
+import { createCipheriv, createHash, randomBytes } from 'node:crypto'
 
 export default function ({ test, eq, bytes }) {
   const utf8 = s => new TextEncoder().encode(s)
@@ -23,10 +24,28 @@ export default function ({ test, eq, bytes }) {
     'cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed' +
     '8086072ba1e7cc2358baeca134c825a7')))
 
-  // Padding boundaries, where an off-by-one in the pad length shows up
-  for (const n of [54, 55, 56, 57, 63, 64, 65, 119, 120, 128]) {
-    test(`sha256 length ${n} matches node crypto`, async () => {})
+  // Differential against node:crypto over every length through several blocks: off-by-ones live
+  // at the padding boundaries (55/56/64 for SHA-256, 111/112/128 for SHA-512)
+  const data = Uint8Array.from({ length: 300 }, (_, i) => (i * 131 + 7) & 0xFF)
+  for (const [name, fn] of [['sha256', sha256], ['sha384', sha384], ['sha512', sha512]]) {
+    test(`${name} matches node crypto for every length 0..300`, () => {
+      for (let n = 0; n <= 300; n++) {
+        const want = createHash(name).update(data.subarray(0, n)).digest()
+        eq(fn(data.subarray(0, n)), want, `${name} length ${n}`)
+      }
+    })
   }
+
+  test('AES-CBC matches node crypto on random keys, IVs and data', () => {
+    for (let i = 0; i < 200; i++) {
+      // Uint8Array copies: a Buffer's slice() is a view, not the copy the library relies on
+      const rand = n => new Uint8Array(randomBytes(n))
+      const key = rand(i % 2 ? 32 : 16), iv = rand(16), plain = rand(16 * (1 + (i % 9)))
+      const c = createCipheriv(key.length === 32 ? 'aes-256-cbc' : 'aes-128-cbc', key, iv)
+      c.setAutoPadding(false)
+      eq(aesCbcEncrypt(key, iv, plain, false), Buffer.concat([c.update(plain), c.final()]), `vector ${i}`)
+    }
+  })
 
   // FIPS-197 Appendix C known-answer tests
   const pt = bytes('00112233445566778899aabbccddeeff')

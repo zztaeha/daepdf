@@ -43,13 +43,21 @@ export type AnchorEntry = { page: number; y: number }
 // nested StructNode or a marked-content reference into a specific page's
 // content stream.
 export interface StructNode {
-  tag:   string
-  alt?:  string
-  lang?: string
-  kids:  StructKid[]
+  tag:    string
+  alt?:   string
+  lang?:  string
+  // a TH's /Scope attribute: which cells it heads
+  scope?: 'Row' | 'Column'
+  kids:   StructKid[]
 }
 export interface McrRef { mcid: number; page: number }
-export type StructKid = StructNode | McrRef
+// an annotation (link or form field) the element owns, by its per-capture key
+export interface AnnotRef { annot: number; page: number }
+export type StructKid = StructNode | McrRef | AnnotRef
+
+export function isStructNode(k: StructKid): k is StructNode {
+  return 'tag' in k
+}
 
 export function isMcrRef(k: StructKid): k is McrRef {
   return 'mcid' in k
@@ -60,9 +68,9 @@ export interface DocDefinition {
   metadata?:  PDFMetadata | undefined
   security?:  PDFSecurity | null | undefined
   bookmarks?: BookmarkEntry[] | undefined
-  // D3/D4: builds /StructTreeRoot + /MarkInfo (taggedPdf) and, additionally,
-  // /Metadata (XMP) + /OutputIntents targeting PDF/A-2a (pdfA implies
-  // taggedPdf — PDF/A-2a's "a" conformance level needs the tag tree)
-  taggedPdf?: boolean
+  // PDF/A-2a: XMP metadata and an OutputIntent; the tags come from the
+  // structRoot passed to applyToPDF
   pdfA?:      boolean
+  // PDF/UA-1: identification, DisplayDocTitle and a required title
+  pdfUA?:     boolean
 }

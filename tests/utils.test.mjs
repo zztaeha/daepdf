@@ -2,6 +2,30 @@ export default async function ({ test, eq, ok, load }) {
   const { hpf, toPdfName, pdfEscape, encodeColor } = await load('src/pdf_doc/utils.ts')
   const { toUnicodeCmap } = await load('src/pdf_doc/cmap.ts')
 
+  test('an embedded font keeps only the tables asked for, intact', async () => {
+    const { onlyTables } = await load('src/pdf_doc/build_fonts.ts')
+    // a minimal sfnt: glyf (4 bytes), head (54), sbix (8), records in tag order
+    const tables = [['glyf', [1, 2, 3, 4]], ['head', Array(54).fill(7)], ['sbix', Array(8).fill(9)]]
+    const size = 12 + tables.length * 16 + tables.reduce((n, [, d]) => n + ((d.length + 3) & ~3), 0)
+    const font = new Uint8Array(size), v = new DataView(font.buffer)
+    v.setUint32(0, 0x00010000); v.setUint16(4, tables.length)
+    let at = 12 + tables.length * 16
+    tables.forEach(([tag, data], i) => {
+      for (let k = 0; k < 4; k++) font[12 + i * 16 + k] = tag.charCodeAt(k)
+      v.setUint32(12 + i * 16 + 8, at); v.setUint32(12 + i * 16 + 12, data.length)
+      font.set(data, at); at += (data.length + 3) & ~3
+    })
+    const out = onlyTables(font, new Set(['glyf', 'head'])), ov = new DataView(out.buffer, out.byteOffset)
+    const tags = Array.from({ length: ov.getUint16(4) }, (_, i) => String.fromCharCode(...out.subarray(12 + i * 16, 16 + i * 16)))
+    eq(tags.join(), 'glyf,head')
+    const glyfAt = ov.getUint32(12 + 8)
+    eq([...out.subarray(glyfAt, glyfAt + 4)].join(), '1,2,3,4')
+    let sum = 0
+    for (let o = 0; o + 4 <= out.length; o += 4) sum = (sum + ov.getUint32(o)) >>> 0
+    eq(sum, 0xB1B0AFBA, 'head.checkSumAdjustment balances the file')
+    ok(onlyTables(font, new Set(['glyf', 'head', 'sbix'])) === font, 'nothing to drop returns the font unchanged')
+  })
+
   test('hpf trims trailing zeros correctly', () => {
     eq(hpf(0), '0'); eq(hpf(1), '1'); eq(hpf(100), '100')
     eq(hpf(1.5), '1.5'); eq(hpf(1.05), '1.05'); eq(hpf(-2.25), '-2.25')
@@ -74,5 +98,16 @@ export default async function ({ test, eq, ok, load }) {
       if (span > 256) bad.push(`<${lo}>..<${hi}> spans ${span}`)
     }
     ok(bad.length === 0, `bfrange too wide: ${bad.join(', ')}`)
+  })
+
+  // and its source codes may differ only in the last byte, so neither the glyph ids nor the
+  // codepoints may carry across a byte boundary inside one range (ÿ U+00FF, Ā U+0100)
+  test('toUnicodeCmap never carries a bfrange across a byte boundary', () => {
+    const across = (lo, hi) => (parseInt(lo, 16) >> 8) !== (parseInt(hi, 16) >> 8)
+    const ranges = map => [...toUnicodeCmap(map).matchAll(/<([0-9a-f]{4})><([0-9a-f]{4})><([0-9a-f]+)>/g)]
+    const gidsCross = ranges(new Map([[0xFE, [0x41]], [0xFF, [0x42]], [0x100, [0x43]], [0x101, [0x44]]]))
+    const cpsCross = ranges(new Map([[10, [0xFE]], [11, [0xFF]], [12, [0x100]], [13, [0x101]]]))
+    ok(gidsCross.every(([, lo, hi]) => !across(lo, hi)), gidsCross.map(m => m[0]).join(' '))
+    ok(cpsCross.every(([, lo, hi, cp]) => !across(cp, (parseInt(cp, 16) + parseInt(hi, 16) - parseInt(lo, 16)).toString(16))), cpsCross.map(m => m[0]).join(' '))
   })
 }

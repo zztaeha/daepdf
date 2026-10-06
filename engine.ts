@@ -3,7 +3,7 @@ import initEngine, {
   register_font_ttc,
   measure_string_width,
   list_registered_fonts,
-} from './src/daepl/wasm/daepl.js'
+} from './src/daegun/wasm/daegun.js'
 
 export {
   initEngine,
@@ -11,18 +11,9 @@ export {
   list_registered_fonts,
 }
 
-export const PAGE_A4     = { width: 595.28, height: 841.89 } as const
-export const PAGE_A5     = { width: 419.53, height: 595.28 } as const
-export const PAGE_LETTER = { width: 612.00, height: 792.00 } as const
 export type ManifestEntry = { path: string; name: string; ttcIndex?: number }
 
 const _fetchCache  = new Map<string, Promise<Uint8Array>>()
-
-let _wasmReady: Promise<void> | null = null
-const _ensureWasm = (): Promise<void> => {
-  if (!_wasmReady) _wasmReady = initEngine().then(() => undefined)
-  return _wasmReady
-}
 
 function _fetchFont(path: string): Promise<Uint8Array> {
   if (!_fetchCache.has(path)) {
@@ -43,7 +34,7 @@ function _isRawFont(bytes: Uint8Array): boolean {
 }
 
 export async function loadAndRegisterFont(entry: ManifestEntry): Promise<void> {
-  await _ensureWasm()
+  await initEngine()
   const bytes = await _fetchFont(entry.path)
 
   const sig = bytes.length >= 4
@@ -65,8 +56,6 @@ export async function loadAndRegisterFont(entry: ManifestEntry): Promise<void> {
     `Font ${entry.path} is ${label}. daepdf embeds TTF, OTF and TTC only \u2013 point src at the uncompressed font.`,
   )
 }
-
-
 
 export function triggerDownload(bytes: Uint8Array, fileName: string): void {
   const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||

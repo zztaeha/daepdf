@@ -53,7 +53,7 @@ export default async function ({ test, eq, ok, load }) {
     eq(p.data[0], 0); eq(p.data[5], 50)
   })
 
-  test('RGBA ct6 splits colour from alpha', () => {
+  test('RGBA ct6 splits color from alpha', () => {
     const raw = rawRows(2, 2, 4, (r, j) => (j % 4 === 3 ? 128 : j + r))
     const p = parseImage(png([ihdr(2, 2, 8, 6), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]))
     ok(p, 'should parse'); eq(p.data.length, 2 * 2 * 3); eq(p.smask.length, 4)

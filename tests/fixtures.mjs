@@ -3,12 +3,12 @@ import path from 'node:path'
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 
-export const WASM = path.join(ROOT, 'src/daepl/wasm/daepl.wasm')
+export const WASM = path.join(ROOT, 'src/daegun/wasm/daegun.wasm')
 
 // The suite needs a real variable font to shape and subset against, and the
 // repo deliberately ships no font assets — point DAEPDF_TEST_FONT at one.
 export const FONT = process.env.DAEPDF_TEST_FONT
-  ?? path.resolve(ROOT, '../beom-cv/public/fonts/inter-var.ttf')
+  ?? path.resolve(ROOT, '../../web-apps/beom-cv/public/fonts/inter-var.ttf')
 
 export function requireFont() {
   if (existsSync(FONT)) return FONT

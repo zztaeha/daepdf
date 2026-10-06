@@ -1,20 +1,16 @@
 import type { BorderRadius, Corner, PathSeg } from '../types/index.js'
 import { PX_PER_PT } from './types.js'
-import { splitByTopLevelComma } from './css.js'
+import { pxToPt, resolveLength, splitByTopLevelComma, splitPositionPair } from './css.js'
 
 export type ClipShape =
   | { kind: 'rect'; x: number; y: number; w: number; h: number; radius?: BorderRadius | undefined }
   | { kind: 'path'; ops: PathSeg[]; evenOdd: boolean }
 
-const RADIUS_TOK = '(closest-side|farthest-side|closest-corner|farthest-corner|[\\d.]+(?:px|%))'
+const RADIUS_TOK = '(closest-side|farthest-side|closest-corner|farthest-corner|[\\d.]+(?:px|%)|calc\\([^()]*\\))'
 
+// px, % and calc(% ± px), as computed style serializes shape arguments
 function lengthPct(tok: string | undefined, ref: number): number {
-  if (!tok) return 0
-  const px = tok.match(/^(-?[\d.]+)px$/)?.[1]
-  if (px !== undefined) return +px / PX_PER_PT
-  const pct = tok.match(/^(-?[\d.]+)%$/)?.[1]
-  if (pct !== undefined) return +pct / 100 * ref
-  return 0
+  return tok ? resolveLength(tok, ref) ?? 0 : 0
 }
 
 // circle()'s single radius keyword resolves against all four side distances at once
@@ -39,7 +35,7 @@ function ellipseAxisRadius(kw: string, centerAlongAxis: number, extent: number):
 
 function resolvePosition(atClause: string | undefined, w: number, h: number): { cx: number; cy: number } {
   if (!atClause) return { cx: w / 2, cy: h / 2 }
-  const [xTok, yTok] = atClause.trim().split(/\s+/)
+  const [xTok, yTok] = splitPositionPair(atClause)
   return { cx: lengthPct(xTok, w), cy: lengthPct(yTok, h) }
 }
 
@@ -48,7 +44,7 @@ function parseInset(inner: string, w: number, h: number): ClipShape | null {
   const sideStr = (roundM?.[1] ?? inner).trim()
   const roundStr = roundM?.[2]?.trim()
 
-  const toks = sideStr.split(/\s+/).filter(Boolean)
+  const toks = splitPositionPair(sideStr).filter(Boolean)
   if (!toks.length || toks.length > 4) return null
   // margin/padding-style 1/2/3/4-value expansion — top/right/bottom/left resolve
   // against height/width/height/width respectively, per each side's own axis
@@ -67,8 +63,8 @@ function parseInset(inner: string, w: number, h: number): ClipShape | null {
     // reuse the same per-corner parsing shape as border-radius (1-4 values, each
     // possibly "H V" for elliptical corners), resolved against the INSET rect
     const [hPart = '', vPart] = roundStr.split('/').map(s => s.trim())
-    const hToks = hPart.split(/\s+/)
-    const vToks = (vPart ?? hPart).split(/\s+/)
+    const hToks = splitPositionPair(hPart)
+    const vToks = splitPositionPair(vPart ?? hPart)
     const at = (arr: string[], i: number) => arr[i] ?? arr[(i + 2) % arr.length] ?? arr[0]
     const corner = (i: number): Corner => ({
       h: lengthPct(at(hToks, i), rw),
@@ -87,7 +83,7 @@ function parseCircle(inner: string, w: number, h: number): ClipShape | null {
   const { cx, cy } = resolvePosition(m[2], w, h)
   const radTok = m[1]
   const r = !radTok ? circleKeywordRadius('closest-side', cx, cy, w, h)
-    : /px$|%$/.test(radTok) ? lengthPct(radTok, Math.sqrt((w * w + h * h) / 2))
+    : !/^(closest|farthest)-/.test(radTok) ? lengthPct(radTok, Math.sqrt((w * w + h * h) / 2))
     : circleKeywordRadius(radTok, cx, cy, w, h)
   return { kind: 'rect', x: cx - r, y: cy - r, w: r * 2, h: r * 2, radius: { all: r } }
 }
@@ -99,10 +95,10 @@ function parseEllipse(inner: string, w: number, h: number): ClipShape | null {
   const { cx, cy } = resolvePosition(m[3], w, h)
   const rxTok = m[1], ryTok = m[2]
   const rx = !rxTok ? ellipseAxisRadius('closest-side', cx, w)
-    : /px$|%$/.test(rxTok) ? lengthPct(rxTok, w)
+    : !/^(closest|farthest)-/.test(rxTok) ? lengthPct(rxTok, w)
     : ellipseAxisRadius(rxTok, cx, w)
   const ry = !ryTok ? ellipseAxisRadius('closest-side', cy, h)
-    : /px$|%$/.test(ryTok) ? lengthPct(ryTok, h)
+    : !/^(closest|farthest)-/.test(ryTok) ? lengthPct(ryTok, h)
     : ellipseAxisRadius(ryTok, cy, h)
   const corner: Corner = { h: rx, v: ry }
   return { kind: 'rect', x: cx - rx, y: cy - ry, w: rx * 2, h: ry * 2, radius: { topLeft: corner, topRight: corner, bottomRight: corner, bottomLeft: corner } }
@@ -115,7 +111,7 @@ function parsePolygon(inner: string, w: number, h: number): ClipShape | null {
   if (ruleM) { evenOdd = ruleM[1] === 'evenodd'; rest = rest.slice(ruleM[0].length) }
 
   const points = splitByTopLevelComma(rest).map(pair => {
-    const [xTok, yTok] = pair.trim().split(/\s+/)
+    const [xTok, yTok] = splitPositionPair(pair)
     return [lengthPct(xTok, w), lengthPct(yTok, h)] as [number, number]
   })
   if (points.length < 3) return null
@@ -135,15 +131,8 @@ function tokenizePathNumbers(s: string): number[] {
   return (s.match(/-?\d*\.?\d+(?:[eE][-+]?\d+)?/g) ?? []).map(Number)
 }
 
-// Arc (A/a) commands have a grammar the generic tokenizer above can't express:
-// large-arc-flag and sweep-flag are each exactly ONE digit (0 or 1), and per
-// spec may run directly into the next value with no separator — "A7 7 0 105
-// 9.3" is rx=7 ry=7 rot=0 laf=1 sf=0 x=5 y=9.3, NOT laf=105. The generic
-// tokenizer's greedy \d* reads "105" as a single number, leaving only 5 of the
-// 7 needed tokens — the whole arc segment then silently drops (parseSvgPath's
-// `if (x === undefined) break`), corrupting exactly this kind of pin/teardrop
-// icon shape. Walked as its own grammar: number,number,number,flag,flag,number,
-// number, repeated for as many arc groups as the command carries.
+// Arc flags are single digits that may run straight into the next number: "A7 7 0 105 9.3"
+// is rx=7 ry=7 rot=0 laf=1 sf=0 x=5 y=9.3, where the generic tokenizer would read laf=105
 function tokenizeArcArgs(s: string): number[] {
   const out: number[] = []
   let i = 0
@@ -267,7 +256,7 @@ export function parseSvgPath(d: string): PathSeg[] {
 
     do {
       if (C === 'M') {
-        const x = next(), y = next(); if (x === undefined) break
+        const x = next(), y = next()
         cx = rel ? cx + x : x; cy = rel ? cy + y : y
         startX = cx; startY = cy
         ops.push({ op: 'm', args: [cx, cy] })
@@ -277,17 +266,16 @@ export function parseSvgPath(d: string): PathSeg[] {
           emitLine(rel ? cx + lx : lx, rel ? cy + ly : ly)
         }
       } else if (C === 'L') {
-        const x = next(), y = next(); if (x === undefined) break
+        const x = next(), y = next()
         emitLine(rel ? cx + x : x, rel ? cy + y : y)
       } else if (C === 'H') {
-        const x = next(); if (x === undefined) break
+        const x = next()
         emitLine(rel ? cx + x : x, cy)
       } else if (C === 'V') {
-        const y = next(); if (y === undefined) break
+        const y = next()
         emitLine(cx, rel ? cy + y : y)
       } else if (C === 'C') {
         const x1 = next(), y1 = next(), x2 = next(), y2 = next(), x = next(), y = next()
-        if (x === undefined) break
         const X1 = rel ? cx + x1 : x1, Y1 = rel ? cy + y1 : y1
         const X2 = rel ? cx + x2 : x2, Y2 = rel ? cy + y2 : y2
         const X  = rel ? cx + x  : x,  Y  = rel ? cy + y  : y
@@ -295,7 +283,6 @@ export function parseSvgPath(d: string): PathSeg[] {
         emitCubic(X1, Y1, X2, Y2, X, Y)
       } else if (C === 'S') {
         const x2 = next(), y2 = next(), x = next(), y = next()
-        if (x === undefined) break
         const X2 = rel ? cx + x2 : x2, Y2 = rel ? cy + y2 : y2
         const X  = rel ? cx + x  : x,  Y  = rel ? cy + y  : y
         const rx1: number = lastCubicCtrl ? 2 * cx - lastCubicCtrl[0] : cx
@@ -304,14 +291,12 @@ export function parseSvgPath(d: string): PathSeg[] {
         emitCubic(rx1, ry1, X2, Y2, X, Y)
       } else if (C === 'Q') {
         const qx = next(), qy = next(), x = next(), y = next()
-        if (x === undefined) break
         const QX = rel ? cx + qx : qx, QY = rel ? cy + qy : qy
         const X  = rel ? cx + x  : x,  Y  = rel ? cy + y  : y
         lastQuadCtrl = [QX, QY]; lastCubicCtrl = null
         emitCubic(...(quadToCubic(cx, cy, QX, QY, X, Y) as [number, number, number, number, number, number]))
       } else if (C === 'T') {
         const x = next(), y = next()
-        if (x === undefined) break
         const X = rel ? cx + x : x, Y = rel ? cy + y : y
         const tqx: number = lastQuadCtrl ? 2 * cx - lastQuadCtrl[0] : cx
         const tqy: number = lastQuadCtrl ? 2 * cy - lastQuadCtrl[1] : cy
@@ -319,7 +304,6 @@ export function parseSvgPath(d: string): PathSeg[] {
         emitCubic(...(quadToCubic(cx, cy, tqx, tqy, X, Y) as [number, number, number, number, number, number]))
       } else if (C === 'A') {
         const rx = next(), ry = next(), rot = next(), laf = next(), sf = next(), x = next(), y = next()
-        if (x === undefined) break
         const X = rel ? cx + x : x, Y = rel ? cy + y : y
         const x0 = cx, y0 = cy
         for (const seg of arcToCubics(x0, y0, rx, ry, rot, !!laf, !!sf, X, Y)) {
@@ -352,16 +336,35 @@ function parsePathFn(inner: string): ClipShape | null {
   return { kind: 'path', ops: ops.map(toPt), evenOdd }
 }
 
-// box: the reference box (border-box) in pt, container-relative. Returned shapes'
+type Box = { x: number; y: number; w: number; h: number }
+
+// A shape's reference box: border-box by default, or the geometry box written next to it
+// (SVG's fill/stroke/view-box map to border-box on HTML elements, as in browsers)
+function referenceBox(kw: string | undefined, border: Box, s: CSSStyleDeclaration): Box {
+  const side = (prop: string) => pxToPt((s as any)[prop] || '0px')
+  const inset = (t: number, r: number, b: number, l: number): Box =>
+    ({ x: border.x + l, y: border.y + t, w: Math.max(0, border.w - l - r), h: Math.max(0, border.h - t - b) })
+  const bw = ['borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth'].map(side)
+  const pad = ['paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft'].map(side)
+  const mar = ['marginTop', 'marginRight', 'marginBottom', 'marginLeft'].map(side)
+  if (kw === 'padding-box') return inset(bw[0]!, bw[1]!, bw[2]!, bw[3]!)
+  if (kw === 'content-box') return inset(bw[0]! + pad[0]!, bw[1]! + pad[1]!, bw[2]! + pad[2]!, bw[3]! + pad[3]!)
+  if (kw === 'margin-box') return inset(-mar[0]!, -mar[1]!, -mar[2]!, -mar[3]!)
+  return border
+}
+
+// box: the border box in pt, container-relative. Returned shapes'
 // coordinates are ALSO container-relative pt — ready to feed straight into a
 // ClipCommand alongside x/y/w/h/radius (rect) or path (path), no further offset.
-export function parseClipPath(value: string, box: { x: number; y: number; w: number; h: number }): ClipShape | null {
+export function parseClipPath(value: string, border: Box, s: CSSStyleDeclaration): ClipShape | null {
   const v = value.trim()
   if (!v || v === 'none') return null
 
-  const fnM = v.match(/^(inset|circle|ellipse|polygon|path)\((.+)\)$/s)
+  const BOX = '(margin-box|border-box|padding-box|content-box|fill-box|stroke-box|view-box)'
+  const fnM = v.match(new RegExp(`^(?:${BOX}\\s+)?(inset|circle|ellipse|polygon|path)\\((.+)\\)(?:\\s+${BOX})?$`, 's'))
   if (!fnM) return null
-  const [, fn, argsRaw = ''] = fnM
+  const [, boxBefore, fn, argsRaw = '', boxAfter] = fnM
+  const box = referenceBox(boxBefore ?? boxAfter, border, s)
 
   let shape: ClipShape | null = null
   if (fn === 'inset')   shape = parseInset(argsRaw, box.w, box.h)

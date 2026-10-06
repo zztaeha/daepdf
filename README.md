@@ -2,7 +2,7 @@
 
 A browser-based HTML-to-PDF engine powered by Rust and WebAssembly. You design your document as HTML and CSS, daepdf captures the exact layout your browser renders, and turns it into a PDF – pixel for pixel.
 
-No server. No headless browser. No approximation. What the browser shows is what the PDF contains.
+No server. No headless browser. No layout approximation. What the browser shows is what the PDF contains.
 
 ---
 
@@ -41,7 +41,7 @@ No server. No headless browser. No approximation. What the browser shows is what
   - [Right-to-left and bidirectional text](#right-to-left-and-bidirectional-text)
   - [Vertical writing mode](#vertical-writing-mode)
 - [Interactive forms](#interactive-forms)
-- [Accessibility and PDF/A](#accessibility-and-pdfa)
+- [Accessibility, PDF/A and PDF/UA](#accessibility-pdfa-and-pdfua)
 - [Images](#images)
   - [Supported formats](#supported-formats)
   - [Object-fit and background images](#object-fit-and-background-images)
@@ -67,12 +67,14 @@ No server. No headless browser. No approximation. What the browser shows is what
 
 When you call `pdf.download()`, daepdf:
 
-1. Injects your HTML into a hidden container in the current page
+1. Lays your HTML out in a hidden frame exactly one page in size, with your app's stylesheets copied in
 2. Reads every element's exact position, size, color, font, and style directly from the browser DOM using `getBoundingClientRect()` and `getComputedStyle()`
-3. Passes that data to a Rust/WASM engine that reconstructs the layout as a real PDF file
+3. Rebuilds that layout as a real PDF file, with a Rust/WASM engine shaping the text and embedding only the glyphs it uses
 4. Triggers a file download in the browser
 
 Because it reads from the live DOM, the output is exact. There is no font metric estimation, no layout engine to re-implement, and no gap between what you see and what you get.
+
+Because that frame is the size of the page, responsive CSS resolves against the PDF page, not your browser window. `@media` queries, `vw`/`vh` and `srcset` all see an A4 page as 794px wide, however wide the window doing the export is.
 
 ---
 
@@ -87,9 +89,11 @@ daepdf runs entirely in the browser. It depends on the DOM – specifically `get
 **It cannot be used in:**
 
 - Node.js or Bun
-- Electron or Tauri desktop apps (even though they have a JS runtime, the rendering context matters)
+- the Node or Rust side of an Electron or Tauri app (its main process or backend) – in the app's window, daepdf runs like in any browser (checked in Electron 44 and in WKWebView, Tauri's macOS webview)
 - Server-side rendering – SSR builds that run on the server will fail to import or execute it
 - CLI tools, scripts, or any non-browser environment
+
+An export finishes in a background tab or a hidden window too.
 
 If you're using a meta-framework like SvelteKit, Next.js, Nuxt, or Remix, you must ensure the import and any calls to daepdf only happen on the client side. See the [Framework integration](#framework-integration) section for exactly how to do this.
 
@@ -113,7 +117,7 @@ That's it. The build output is published, so nothing is compiled on your machine
 import pdf from 'daeepdf'
 ```
 
-That single import is all you need. The engine starts warming up automatically the moment this line runs.
+That single import is all you need. The engine loads the first time you render; call [`pdf.warmup()`](#pdfwarmup) to start it earlier.
 
 ### From a local checkout
 
@@ -127,7 +131,7 @@ Use `npm link` instead when you are editing daepdf itself and want changes picke
 
 ### What you do not need to do
 
-- No WASM file setup or configuration
+- No WASM file setup or configuration (one exception: esbuild, below)
 - No engine initialization calls
 - No font loading or registration boilerplate
 - No renderer imports
@@ -135,6 +139,8 @@ Use `npm link` instead when you are editing daepdf itself and want changes picke
 - No path aliases or tsconfig changes
 - No hand-written HTML-escape helper – `escapeHtml()` is exported, see [Escaping HTML](#escaping-html)
 - No duplicate `@font-face` declaration for the live preview – see [Live preview](#live-preview)
+
+**The engine file and your bundler.** daepdf loads its engine, `daegun.wasm`, from beside its own module with `new URL('./daegun.wasm', import.meta.url)`. Vite and webpack 5+ recognize that and ship the file with your build, in development too, and so do the frameworks built on Vite (SvelteKit, Nuxt, Astro). esbuild doesn't: copy `node_modules/daeepdf/dist/daegun.wasm` into the folder your bundle is served from, or every export fails to load the engine.
 
 ### Suggested project structure
 
@@ -155,14 +161,15 @@ The template file is the one thing every other piece of your app imports and cal
 
 ## Quick start
 
-Here is the minimum working example – a one-page PDF with a heading and a paragraph:
+Here is the minimum working example – a one-page PDF with a heading and a paragraph. Text prints only in a font the template declares with `@font-face`, so point `src` at a TTF or OTF your app serves (see [Fonts](#fonts)):
 
 ```ts
 import pdf from 'daeepdf'
 
 const html = `
   <style>
-    .page { font-family: sans-serif; padding: 40pt; color: #111; }
+    @font-face { font-family: 'Inter'; src: url('/fonts/inter-var.ttf'); font-weight: 100 900; }
+    .page { font-family: Inter; padding: 40pt; color: #111; }
     .page * { box-sizing: border-box; margin: 0; padding: 0; }
   </style>
   <div class="page">
@@ -190,23 +197,23 @@ await pdf.download(html, 'A4', 'invoice.pdf')
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `html` | `string` | Yes | The HTML string to render. Include a `<style>` block for any custom CSS – it's not required, but a document with no styling at all is rarely what you want. |
+| `html` | `string` | Yes | The HTML string to render. Include a `<style>` block with your CSS and an `@font-face` for each font – text prints only in declared fonts (see [Fonts](#fonts)). |
 | `size` | `PageSize` | Yes | Page size as a string or custom object. See [Page sizes and orientation](#page-sizes-and-orientation). |
 | `filename` | `string` | Yes | The name of the downloaded file, including `.pdf`. |
 | `security` | `SecurityOption` | No | Encryption preset or custom config. See [PDF permissions](#pdf-permissions). |
-| `extras` | `RenderExtras` | No | Orientation, metadata, bookmarks, headers/footers, tagging, PDF/A. See the relevant sections below. |
+| `extras` | `RenderExtras` | No | Orientation, metadata, bookmarks, headers/footers, tagging, PDF/A, PDF/UA. See the relevant sections below. |
 
 ---
 
-### `pdf.render(html, size, security?, extras?)`
+### `pdf.render(html, size?, security?, extras?)`
 
-Renders the HTML and returns the raw PDF as a `Uint8Array` instead of downloading it. Use this when you need to upload the PDF to a server, show it in an `<iframe>`, or process the bytes yourself.
+Renders the HTML and returns the raw PDF as a `Uint8Array` instead of downloading it. Use this when you need to upload the PDF to a server, show it in an `<iframe>`, or process the bytes yourself. The parameters are `pdf.download()`'s without the filename; `size` defaults to `'A4'`.
 
 ```ts
 const bytes = await pdf.render(html, 'A4')
 
 // Show in an iframe
-const blob = new Blob([bytes], { type: 'application/pdf' })
+const blob = new Blob([bytes as BlobPart], { type: 'application/pdf' })
 const url  = URL.createObjectURL(blob)
 iframeEl.src = url
 ```
@@ -215,9 +222,9 @@ iframeEl.src = url
 
 ### `pdf.warmup()`
 
-daepdf automatically starts loading its WASM engine the moment the module is imported – you do not need to call this. `warmup()` simply returns a promise that resolves when the engine is fully ready.
+daepdf loads its WASM engine on first use – `render()` and `download()` start it themselves, so you do not need to call this. `warmup()` starts loading it early and returns a promise that resolves when the engine is ready.
 
-You would only call this if you need to explicitly wait for the engine before doing something – for example, enabling an export button only after the engine is loaded:
+Call it when the page opens so the first export doesn't wait for the engine, or when you need to wait for the engine explicitly – for example, enabling an export button only after the engine is loaded:
 
 ```ts
 // Disable the button while the engine loads
@@ -226,7 +233,7 @@ await pdf.warmup()
 button.disabled = false
 ```
 
-In most apps you will never need this. By the time a user clicks "Export", the engine has already been loading in the background since the page opened.
+Calling it more than once, or at the same time as a render, is safe – every caller shares one engine.
 
 ---
 
@@ -259,6 +266,48 @@ escapeHtml(`O'Brien & Sons <b>"bold"</b>`)
 ```
 
 See [Escaping HTML](#escaping-html) for when and why to use it.
+
+---
+
+### `previewHTML(html, container, config)`
+
+Renders the HTML as paginated page cards inside `container`, showing what the PDF will contain. Returns a promise that resolves once the pages are on screen; calls made while one is still rendering are coalesced, so only the newest renders.
+
+```ts
+import { previewHTML } from 'daeepdf'
+
+await previewHTML(html, container, { size: 'A4' })
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `html` | `string` | The same HTML string you export. |
+| `container` | `HTMLElement` | Where the page cards go. It must be attached to the document, or the call throws. |
+| `config` | `PageConfig` | `{ size, orientation? }`, see [Page sizes and orientation](#page-sizes-and-orientation). |
+
+See [Live preview](#live-preview) for scaling, reactive updates and fonts.
+
+---
+
+### `renderHTMLtoPDF(html, config, options?, fonts?)`
+
+The function `pdf.render()` is built on, for when you'd rather pass one options object. Returns the PDF as a `Uint8Array`.
+
+```ts
+import { renderHTMLtoPDF } from 'daeepdf'
+
+const bytes = await renderHTMLtoPDF(html, { size: 'A4', orientation: 'landscape' }, {
+  security: null,
+  metadata: { title: 'Q4 Report' },
+})
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `html` | `string` | The HTML string to render. |
+| `config` | `PageConfig` | `{ size, orientation? }`. |
+| `options` | `HTMLToPDFOptions` | Metadata, bookmarks, headers/footers, tagging, PDF/A, PDF/UA, and `security` as a `PDFSecurity` object or `null`. The string presets (`'locked'`, …) are a `pdf.render()`/`pdf.download()` feature; omitting `security` here gives the same default encryption. |
+| `fonts` | `FontBridgeMap` | Optional. Maps a CSS `font-family` name to a font your templates register with `@font-face`, so text set in that family uses it. |
 
 ---
 
@@ -317,6 +366,7 @@ import { escapeHtml } from 'daeepdf'
 export function buildDocumentHTML(data: MyData): string {
   return `
     <style>
+      @font-face { font-family: 'Inter'; src: url('/fonts/inter-var.ttf'); font-weight: 100 900; }
       .page {
         box-sizing: border-box;
         font-family: Inter, sans-serif;
@@ -352,13 +402,13 @@ You call this function, pass the returned HTML to `pdf.download()`, and you're d
 Numbers and booleans are safe to interpolate directly – they cannot contain special HTML characters.
 
 ```ts
-// safe -- number
+// safe – number
 `<td>${item.qty}</td>`
 
-// safe -- boolean
+// safe – boolean
 `<div class="${isActive ? 'active' : ''}">`
 
-// must escape -- string from user
+// must escape – string from user
 `<td>${escapeHtml(item.description)}</td>`
 `<div class="name">${escapeHtml(user.fullName)}</div>`
 ```
@@ -373,13 +423,13 @@ Numbers and booleans are safe to interpolate directly – they cannot contain sp
 
 ### CSS
 
-Every CSS feature your browser supports works in daepdf:
+The CSS your layouts rely on works in daepdf, including:
 
 - Flexbox and CSS Grid
 - `border-radius`, `box-shadow`, `opacity`
 - CSS gradients (linear, radial, and conic) – including gradient stops with partial alpha; a translucent-to-transparent fade renders as a real fade, not flattened to one opaque color
 - `border-image` (9-slice, including gradient sources – see [Images](#images))
-- CSS counters (`counter-reset`/`counter-increment`/`counter-set`) and list markers (`::marker`, every `list-style-type`)
+- CSS counters (`counter-reset`/`counter-increment`/`counter-set`, `counter()`/`counters()`) and list markers (`::marker`; `list-style-type` `disc`, `circle`, `square`, `disclosure-open`/`-closed`, `decimal`, `decimal-leading-zero`, `lower`/`upper-alpha` and `-latin`, `lower`/`upper-greek`, `lower`/`upper-roman`, or a quoted string – any other style, such as `armenian` or `cjk-decimal`, prints as `decimal` even where the browser shows it natively)
 - `text-transform`, `letter-spacing`, `white-space`, `text-overflow: ellipsis`, `hyphens: auto`
 - `::first-letter` and `::first-line`
 - `outline` (width, style, color, offset – grows outward with a rounded box's own corner radius)
@@ -406,18 +456,15 @@ Use `pt` (points) for sizing. Font sizes, padding, margin, gap, border-width –
 .divider  { border-top: 0.5pt solid #e0e0e0; }
 ```
 
-#### Scope everything to a wrapper class
+#### Template CSS stays in the template, app CSS comes along
 
-**This is the single most important CSS rule in daepdf.** Never use `body`, `*`, or `html` selectors in your template CSS.
+Your template is laid out in its own frame, so nothing in its CSS can reach your app. `body`, `html` and `:root` rules apply to the template's root, and `*` only matches the template's own elements.
 
-When daepdf measures your layout, it injects the template HTML directly into the live browser page. Any selector that matches the whole document – `*`, `body`, `html` – will also match your app's own elements and cause your app's styling to break or shift.
+It works the other way too: your app's stylesheets are copied into that frame, so a template can use your app's classes – Tailwind utilities, a Quasar or Vuetify grid, your own design system – and they resolve at the page's size. The flip side is that app-wide rules (a global `* { box-sizing }`, a `body` font) reach the template just as they reach your app's own pages.
+
+Giving the template a root wrapper class and scoping your rules under it lets them win over app-wide element and class rules where the two disagree:
 
 ```css
-/* bad -- leaks out of the template and into your app */
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: Inter, sans-serif; background: white; }
-
-/* good -- fully contained */
 .page { box-sizing: border-box; font-family: Inter, sans-serif; }
 .page *, .page *::before, .page *::after {
   box-sizing: inherit;
@@ -426,22 +473,21 @@ body { font-family: Inter, sans-serif; background: white; }
 }
 ```
 
-Give your root wrapper a specific class name (`.page`, `.invoice`, `.cv-doc`, etc.) and prefix every other selector with it.
-
 ---
 
 ### Filters and masks
 
 `filter` and `mask-image` have no PDF operator equivalent, so an element using either is rasterized – its entire subtree (box, text, children) is painted to an offscreen canvas and embedded as one flattened image, with the filter/mask effect baked in.
 
-This works well for the common case (a decorative box, an icon, a simple label), but the rasterizer is intentionally simple, not a full layout engine, so it has real limits:
+The rasterizer paints background colors and gradients inside the element's rounded corners, images, and text word by word where the browser laid it out, in the template's own fonts. A `mask-image` can be a gradient or a `url()` image, sized, positioned and tiled through `mask-size`, `mask-position` and `mask-repeat` like a background. It is still a painter, not a layout engine, so it has real limits:
 
-- **Text has no wrapping or multi-line layout.** Each text node paints as a single line, vertically centered in its box. A multi-line paragraph inside a filtered or masked element collapses onto one line instead of wrapping.
-- **Background gradients are not reproduced.** A gradient background falls back to the element's plain `background-color` (or nothing, if unset).
+- **Text inside is pixels.** It can't be selected or searched, and text decorations (underlines and the like) aren't painted.
+- **`url()` backgrounds aren't reproduced** inside the raster; gradients and colors are.
 - **Only the top border is read.** Border width, style, and color are taken from the top side and applied uniformly to all four sides – a box with different per-side borders paints as if every side matched the top one.
 - **`filter` and `mask-image` together only apply the filter.** If an element has both set, the mask is silently skipped rather than combined with the filtered result.
+- **A cross-origin mask image needs CORS.** One served without CORS headers can't be read back from the canvas, so the masked element is skipped (the rest of the document still renders).
 
-If you need pixel-perfect text or a gradient background under a filter or mask, restructure the template so the filter/mask applies to a plain decorative element (a box, an icon) rather than one containing real text or a gradient.
+If you need selectable text under a filter or mask, restructure the template so the filter/mask applies to a plain decorative element (a box, an icon) rather than one containing real text.
 
 **`background-clip: text`** (the "gradient text" trick, usually paired with `color: transparent` or `-webkit-text-fill-color: transparent`) has the same underlying problem for a different reason: a PDF box fill can't be clipped to glyph outlines. Instead of the real gradient, the text renders in a flat, solid color – the gradient's first color stop for a gradient background, the element's own plain `background-color` when there's no gradient (a `url()` image background falls back to this too, not to the image itself), or black as a last-resort default if neither is set.
 
@@ -455,8 +501,8 @@ As part of that same parsing pass, daepdf automatically removes:
 
 - `<script>` tags, entirely
 - Any `on*` event handler attribute (`onclick`, `onerror`, etc.)
-- `javascript:`, `data:`, and `vbscript:` URLs in `href` attributes
-- `<link rel="stylesheet">` – external stylesheets are not fetched; inline your CSS in a `<style>` block instead (a console warning tells you if one was removed)
+- `javascript:` and `vbscript:` URLs in `href` attributes, and `data:` URLs too, except on an SVG `<image>` or `<feImage>`, which only display them
+- `<link>` tags – external stylesheets are not fetched; inline your CSS in a `<style>` block instead (a console warning tells you when a stylesheet link was removed)
 - `@import` inside a `<style>` block – inline the imported stylesheet's contents instead (also warned)
 - `<object>`, `<embed>`, `<iframe>`, `<video>`, and `<audio>` tags, entirely, with no console warning – none of these have a PDF equivalent to fall back to
 
@@ -465,13 +511,13 @@ None of this requires configuration – it happens on every `render()`/`download
 **Two more guarantees that follow from the same mechanism, so you don't have to think about them:**
 
 - **Your `<style>` block can go anywhere in the template string.** The browser's own HTML parser can silently relocate a `<style>` tag into the parsed document's `<head>` depending on where it sits in the markup – a well-known `DOMParser` quirk. daepdf collects styles from both the parsed head and body before injecting them, so this relocation never causes your CSS to go missing, regardless of where you wrote the `<style>` tag.
-- **Two templates using the same class name never collide.** Every call gets its own internal CSS scope – reusing `.box` or `.header` across an invoice template and a CV template (even a live preview and an export running back to back) never lets one template's rule apply to the other's markup. This is also what makes the "[scope everything to a wrapper class](#css)" rule above actually hold: a stray `body`/`:root`/`html` selector in your CSS is automatically confined to your own template's container instead of reaching your app, rather than silently depending on you never making that mistake.
+- **Two templates using the same class name never collide.** Every call gets its own internal CSS scope – reusing `.box` or `.header` across an invoice template and a CV template (even a live preview and an export running back to back) never lets one template's rule apply to the other's markup. A `body`/`:root`/`html` selector in your CSS applies to your own template's root, and since every template is laid out in its own frame, none of it can reach your app.
 
 ---
 
 ### Fonts
 
-Declare fonts with `@font-face` inside your template's `<style>` block. Point `src` at the font file in your project's public folder.
+Declare fonts with `@font-face` inside your template's `<style>` block. Point `src` at the font file in your project's public folder. **Text prints only in declared fonts:** daepdf can't read the fonts installed on a machine, so text whose `font-family` list names no declared font (just `sans-serif`, say, or an `Arial` with no `@font-face` of its own) is left out, with a console warning naming the font.
 
 ```css
 <style>
@@ -492,7 +538,7 @@ daepdf handles everything automatically:
 - Registers it with the PDF engine
 - Subsets it – only the characters actually used in the document are embedded in the PDF, keeping file sizes small
 
-**TTF, OTF and TTC (font collection) files work**, with no configuration difference between them. **WOFF and WOFF2 do not** – daepdf reads the font bytes directly and does not decompress them, so point `src` at the uncompressed file. A WOFF2 is reported by name rather than failing quietly.
+**TTF, OTF and TTC (font collection) files work**, with no configuration difference between them. **WOFF and WOFF2 do not** – daepdf reads the font bytes directly and does not decompress them, so point `src` at the uncompressed file. A WOFF2 is reported by name rather than failing quietly. CFF2 fonts, static or variable, print as well, but a `pdfA` or `pdfUA` export that uses one doesn't pass validation yet.
 
 If you serve WOFF2 to the browser for its smaller download, declare a second `@font-face` for daepdf pointing at the TTF, or serve the TTF and let daepdf subset it – only the characters the document actually uses are embedded.
 
@@ -502,17 +548,15 @@ If you serve WOFF2 to the browser for its smaller download, declare a second `@f
 
 **The font must be accessible from the browser.** The `url()` in `@font-face` is fetched by the browser, so it must be in your public folder and served over HTTP (or HTTPS). Local file paths (`C:\fonts\...`) do not work.
 
-**A character your font doesn't have falls back automatically.** If your `font-family`'s first choice can't render a given character (an emoji, a CJK character in a Latin-only font), daepdf tries the rest of your declared `font-family` list first, then falls through to any other font registered anywhere in the document, before giving up on that one character. You don't need to declare a fallback font explicitly for this to happen – it always tries.
+**A character your font doesn't have falls back automatically.** If your `font-family`'s first choice can't render a given character (an emoji, a CJK character in a Latin-only font), daepdf tries the rest of your declared `font-family` list first, then falls through to any other font registered anywhere in the document, before giving up on that one character. You don't need to declare a fallback font explicitly for this to happen – it always tries. A character followed by the emoji presentation selector (`❤️`) takes the first color font in your `font-family` list that has it, as browsers do.
 
-**Color/emoji glyphs render correctly but are not selectable text.** A font's own color glyphs (COLR or a bitmap strike) draw as a real, correctly-colored picture in the PDF, but the underlying text-layer reference for that glyph is metrics-only – position and spacing, not a selectable character. Surrounding plain text is unaffected; only the emoji/color glyph itself can't be selected, copied, or searched.
+**Color fonts print in color and copy as text.** Emoji and other color fonts print as their colored picture: COLR fonts (COLRv1, such as current Noto Color Emoji and Nabla, and COLR v0) as vector art that stays sharp at any zoom, with gradients, blending and a variable font's weight and optical size; bitmap fonts (Apple Color Emoji, the bitmap version of Noto Color Emoji) as the font's own images. Every color glyph copies and searches as its real characters, in Preview too, flags, skin tones and joined sequences included. One approximation: COLRv1's additive `PLUS` blending has no PDF equivalent and is drawn as `Screen`, slightly darker where two layers overlap.
 
 ---
 
 ### Ruled lines
 
-Do not use `<hr>` for horizontal dividers. `<hr>` has browser-specific default styles – particularly on mobile Safari – that make it behave inconsistently and can cause it to disappear in the exported PDF.
-
-Use a `<div>` with a `border-top` instead:
+An `<hr>`'s look (an inset border with margins) comes from the browser's own stylesheet, and on mobile Safari it can go missing from the export. For a divider you control, use a `<div>` with a `border-top`:
 
 ```css
 .rule {
@@ -527,7 +571,7 @@ Use a `<div>` with a `border-top` instead:
 <div class="rule"></div>
 ```
 
-This is reliable on every browser and every device.
+This draws the same line on every browser and every device.
 
 ---
 
@@ -545,7 +589,7 @@ This applies to all `<a>` elements inside the template, whether you added them o
 
 An `<a href="https://...">` produces a real, clickable link annotation in the PDF. An `<a href="#anchorId">` produces a real internal jump-to link – see [Bookmarks and internal links](#bookmarks-and-internal-links).
 
-**Only `http://`, `https://`, `mailto:`, and `#fragment` hrefs become a real clickable link annotation.** `<a href="tel:+1...">` (or any other URI scheme) still renders as plain text – the same region isn't clickable in the PDF, even though it works as tap-to-call in the browser.
+**`http://`, `https://`, `mailto:`, `tel:` and `#fragment` hrefs become real clickable link annotations.** A relative href (`/pricing`, `terms.html`) is resolved against the page's address, so it still leads somewhere from the PDF. Any other URI scheme renders as plain text, not clickable.
 
 ---
 
@@ -554,10 +598,10 @@ An `<a href="https://...">` produces a real, clickable link annotation in the PD
 If you use a translation system (i18n), store raw characters in your translation strings – not HTML entities.
 
 ```ts
-// wrong -- the & is already escaped
+// wrong – the & is already escaped
 { 'label': 'Sales &amp; Marketing' }
 
-// correct -- raw character, escapeHtml() will handle it
+// correct – raw character, escapeHtml() will handle it
 { 'label': 'Sales & Marketing' }
 ```
 
@@ -583,6 +627,8 @@ await pdf.download(html, 'A4', 'invoice.pdf')
 ```
 
 `previewHTML(html, container, config)` renders each page as a white card with a subtle shadow, stacked vertically inside the container. The template function is the single source of truth – the same call drives both the preview and the export. There is no second design and no duplication.
+
+Each card holds its own page-sized frame, so the preview resolves `@media`, `vw`/`vh` and your app's stylesheets exactly the way the export does. `previewHTML` returns a promise that resolves once the pages are on screen. You don't have to await it: calls made while a render is still running are coalesced, and only the newest one renders.
 
 **There is no separate "preview version" and "export version" of a document to build or keep in sync.** Your template function (`buildInvoiceHTML`, or whatever you call it) is the only place the document's design lives. Both the live preview and the real export just call it and hand the resulting string to a different daepdf function – `previewHTML` for an on-screen preview, `pdf.download`/`pdf.render` for the real file. If you change the template, both update automatically, because there is only one template to change. A minimal component-style wiring:
 
@@ -636,7 +682,7 @@ function updatePreview() {
 
 ### Fonts just work
 
-Declare `@font-face` once, in your template – the same declaration used for PDF embedding. `previewHTML` detects it, loads it into the browser's real font set the first time it's used, and reuses that across every subsequent call and every other preview on the page. There is nothing else to configure: no second `@font-face` declaration in your app's global CSS, no flash of fallback text, and no repeated network fetch on every re-render.
+Declare `@font-face` once, in your template – the same declaration used for PDF embedding. `previewHTML` detects it, loads it once into each preview page, and reuses it on every re-render. Pages are measured only after the font has loaded, so page breaks in the preview match the export. There is nothing else to configure: no second `@font-face` declaration in your app's global CSS and no repeated network fetch on every re-render.
 
 ### Without a preview
 
@@ -655,10 +701,13 @@ Same template function, same output, no preview step.
 Metadata, bookmarks, and headers/footers are all passed through the same `extras` argument as `pdf.download()`/`pdf.render()`'s last parameter.
 
 ```ts
+// a header is laid out on its own, so it declares its font too (see Headers and footers)
+const font = `<style>@font-face { font-family: 'Inter'; src: url('/fonts/inter-var.ttf'); }</style>`
+
 await pdf.download(html, 'A4', 'report.pdf', undefined, {
   metadata:  { title: 'Q4 Report', author: 'Acme Inc.' },
   bookmarks: [{ title: 'Summary', page: 1 }, { title: 'Details', page: 2 }],
-  header:    (page, total) => `<div style="font-size:8pt;text-align:right;">Page ${page} of ${total}</div>`,
+  header:    (page, total) => `${font}<div style="font:8pt Inter;text-align:right;">Page ${page} of ${total}</div>`,
 })
 ```
 
@@ -719,14 +768,16 @@ This produces a real internal jump-to-page link in the PDF, not just a browser-o
 `header` and `footer` are functions that receive the current page number and the total page count, and return an HTML string – rendered in a fixed band at the top or bottom of every page:
 
 ```ts
+const font = `<style>@font-face { font-family: 'Inter'; src: url('/fonts/inter-var.ttf'); }</style>`
+
 extras: {
-  header: (page, total) => `
-    <div style="font-size:8pt;color:#888;border-bottom:0.5pt solid #ddd;padding-bottom:4pt;">
+  header: (page, total) => `${font}
+    <div style="font:8pt Inter;color:#888;border-bottom:0.5pt solid #ddd;padding-bottom:4pt;">
       Acme Inc. – Confidential
     </div>
   `,
-  footer: (page, total) => `
-    <div style="font-size:8pt;color:#888;text-align:center;">
+  footer: (page, total) => `${font}
+    <div style="font:8pt Inter;color:#888;text-align:center;">
       Page ${page} of ${total}
     </div>
   `,
@@ -737,7 +788,7 @@ The header/footer band's height is measured automatically from its own content, 
 
 **That height is measured once, from a single representative page, not per page.** daepdf renders your `header`/`footer` callback once (as if it were page 1 of 1) to measure how tall its content actually is, then reuses that same height for every page. Ordinary page-number digit-count differences ("Page 1 of 1" vs. "Page 250 of 250") don't change a template's wrapped line height in practice, so this is not something to worry about in the typical case. If your header or footer's content is designed to genuinely vary in height from page to page (not just digit count – conditionally showing an extra line on some pages, for example), keep in mind that only the first-page measurement is used: taller content on a later page is clipped to that original height rather than growing the band or overflowing into your main content.
 
-**If a header or footer uses a custom font, declare `@font-face` for it inside that same `header`/`footer` string.** Each callback's returned HTML is parsed and its fonts registered independently from your main template – a font declared only in the main template's `<style>` block is not automatically available inside `header`/`footer`, and vice versa.
+**Declare the font inside each `header`/`footer` string.** Each callback's HTML is laid out on its own and inherits nothing from your template, so give it an `@font-face` in that same string and a `font-family` naming it. With no declared font at all, its text is left out (a console warning names the font). Naming a font that only the main template declares prints it, but laid out with the browser's fallback font, so words can shift or get cut off.
 
 `position: fixed` content placed directly in your main template (not inside `header`/`footer`) repeats on every page too, anchored at its own position on the page – useful for a watermark or a background stamp that isn't tied to the page-number logic `header`/`footer` provide. This repeats correctly both in the real PDF export and in `previewHTML`'s on-screen preview.
 
@@ -768,9 +819,9 @@ A flex or grid container taller than one page can't move as a unit, so daepdf st
 .chapter { break-before: page; }
 ```
 
-Accepted values: `page`, `always`, `left`, `right` – daepdf treats all four the same way (a single fresh page); it does not distinguish left-hand from right-hand pages for double-sided printing. This works on any element, not just specific tags, and it forces a break even on content that's nowhere near overflowing a page on its own (a single short paragraph with `break-before: page` still starts a new page).
+Accepted values: `page`, `left`, `right`, `recto`, `verso` – daepdf treats them all the same way (a single fresh page); it does not distinguish left-hand from right-hand pages for double-sided printing. This works on any element, not just specific tags, and it forces a break even on content that's nowhere near overflowing a page on its own (a single short paragraph with `break-before: page` still starts a new page).
 
-The older `page-break-before` / `page-break-after` / `page-break-inside` property names work identically – browsers alias them to the modern `break-*` properties automatically, and daepdf reads the resolved computed value either way.
+The older `page-break-before` / `page-break-after` / `page-break-inside` property names work identically – browsers alias them to the modern `break-*` properties automatically (`page-break-before: always` becomes `page`), and daepdf reads the resolved computed value either way.
 
 ### Widows and orphans
 
@@ -842,6 +893,8 @@ Real `<input>`, `<textarea>`, and `<select>` elements in your template become re
 
 ```html
 <style>
+  @font-face { font-family: 'Inter'; src: url('/fonts/inter-var.ttf'); }
+  body { font-family: Inter; }
   input, textarea, select { font-family: Inter, sans-serif; font-size: 10pt; }
 </style>
 <label>Name <input type="text" name="fullName" value="Jane Doe"></label>
@@ -858,7 +911,7 @@ Real `<input>`, `<textarea>`, and `<select>` elements in your template become re
 
 The element's current `value` (or `checked` state) becomes the field's initial value in the PDF, and it also prints statically in the same spot – so the field looks right even in a viewer that doesn't render form widgets.
 
-**Supported input types:** `text`, `email`, `tel`, `url`, `number`, `password`, `search` (or no `type` attribute at all), plus `checkbox` and `radio`. Other input types (`date`, `color`, `range`, `file`, and similar) have no PDF form-field equivalent and currently produce no visible output at all – avoid them in export templates, or wrap the value in a plain `<div>` instead.
+**Supported input types:** `text`, `email`, `tel`, `url`, `number`, `password`, `search` (or no `type` attribute at all), plus `checkbox` and `radio`. Other input types (`date`, `color`, `range`, `file`, and similar) have no PDF form-field equivalent: they become no field, and only the control's empty box prints, without its value – avoid them in export templates, or show the value in a plain `<div>` instead.
 
 **Give every field's font-family an explicit value.** Browsers apply their own default control font to form elements rather than inheriting the page's font – an input with no `font-family` declared anywhere on it (directly or inherited) won't resolve a usable font for its PDF appearance.
 
@@ -868,9 +921,9 @@ Combine with the `'fillable'` security preset (see [PDF permissions](#pdf-permis
 
 ---
 
-## Accessibility and PDF/A
+## Accessibility, PDF/A and PDF/UA
 
-Two independent, optional flags on `extras`:
+Three optional flags on `extras`:
 
 ```ts
 await pdf.download(html, 'A4', 'report.pdf', undefined, {
@@ -878,7 +931,7 @@ await pdf.download(html, 'A4', 'report.pdf', undefined, {
 })
 ```
 
-**`taggedPdf: true`** builds a real structure tree (`/StructTreeRoot`) from your HTML's own semantic tags – `<h1>`–`<h6>` become headings, `<p>` becomes a paragraph, `<table>`/`<tr>`/`<td>` become table structure, `<ul>`/`<ol>`/`<li>` become list structure, `<img alt="...">` becomes a tagged figure with its alt text, `<a>` becomes a link. This is what lets a screen reader announce your document's real reading order and structure instead of a flat stream of unrelated text and images. Using semantic HTML elements in your template (rather than, say, styling every heading as a plain `<div>`) is what makes this worth turning on.
+**`taggedPdf: true`** builds a real structure tree (`/StructTreeRoot`) from your HTML's own semantic tags – `<h1>`–`<h6>` become headings, `<p>` becomes a paragraph, `<table>`/`<tr>`/`<td>`/`<th>` become table structure (header cells get a row or column scope, from their `scope` attribute or their position), `<ul>`/`<ol>`/`<li>` become list structure (each item's marker as its label, its content as its body), `<img alt="...">` and `<svg>` become tagged figures with their alt text (from `alt`, `aria-label` or the SVG's `<title>`; `alt=""` marks an image decorative), `<a>` becomes a link (holding its clickable link annotation, described by its `aria-label`, `title`, text, an image's alt text or its target, in that order), and form controls become form elements holding their fields (named by `aria-labelledby`, `aria-label`, their `<label>`, `title` or `placeholder`, in that order). Everything drawn that isn't content – backgrounds, borders, underlines, headers and footers – is marked as an artifact, so a screen reader skips it. This is what lets a screen reader announce your document's real reading order and structure instead of a flat stream of unrelated text and images. Using semantic HTML elements in your template (rather than, say, styling every heading as a plain `<div>`) is what makes this worth turning on.
 
 To exclude purely decorative content from the reading order entirely (a background shape, a spacer `<div>`, a repeated icon) – rather than have it show up as a meaningless untitled element between real content – mark it `role="presentation"`, `role="none"`, or `aria-hidden="true"`. The whole subtree is skipped: no structure element, no marked content, nothing for a screen reader to stumble over.
 
@@ -888,9 +941,20 @@ await pdf.download(html, 'A4', 'report.pdf', undefined, {
 })
 ```
 
-**`pdfA: true`** targets PDF/A-2a archival conformance (embeds an ICC color profile, XMP metadata, and implies `taggedPdf` – PDF/A's accessible conformance level requires the structure tree). PDF/A disallows encryption entirely, so passing both `pdfA` and `security` together throws immediately rather than silently producing a non-conformant file.
+**`pdfA: true`** targets PDF/A-2a archival conformance (embeds an ICC color profile, XMP metadata, and implies `taggedPdf` – PDF/A's accessible conformance level requires the structure tree). PDF/A disallows encryption entirely: with `pdfA` set, the default security is skipped, and passing an explicit `security` as well throws immediately rather than silently producing a non-conformant file.
 
-Structural correctness here is verified against the ISO 32000-2 / PDF/A-2 specification directly, not certified by an external validator (veraPDF or similar) – a genuinely strong effort, not a certified claim.
+Output is checked with [veraPDF](https://verapdf.org) against PDF/A-2a, 2u and 2b on representative documents – headings, lists, a multi-page table, links, form fields, images, gradients with transparency, headers and footers, right-to-left and CJK text, vertical text, emoji (bitmap and COLRv1), filters and masks, and a 30-section document. That is a check, not a certification of every document you can write. One known gap: a document using a CFF2 font doesn't pass yet.
+
+```ts
+await pdf.download(html, 'A4', 'report.pdf', undefined, {
+  pdfUA: true,
+  metadata: { title: 'Quarterly report', language: 'en-US' },
+})
+```
+
+**`pdfUA: true`** targets PDF/UA-1 (ISO 14289-1), the accessibility standard: it implies `taggedPdf`, declares PDF/UA in the XMP metadata, and makes viewers show the document title instead of the file name. PDF/UA requires a title, so `pdfUA` without `metadata.title` throws. It combines with `pdfA` (the file then declares both) and with encryption. Every figure needs alternative text; a console warning counts any that lack it. Checked with veraPDF against PDF/UA-1, alone and with PDF/A-2a, on the same representative documents.
+
+PDF/A and PDF/UA forbid drawing the "missing glyph" box, so with `pdfA` or `pdfUA` a character that no registered font covers is left out (its space is kept, and a console warning says how many). Copying the text still gives the real characters. Register a font that covers every script you use with `@font-face`.
 
 ---
 
@@ -900,9 +964,9 @@ Structural correctness here is verified against the ISO 32000-2 / PDF/A-2 specif
 
 daepdf officially supports exactly 4 raster image formats: **JPEG, PNG, WebP, and AVIF** (plus SVG as vector graphics, see [SVG and vector graphics](#svg-and-vector-graphics)).
 
-`<img>` works with JPEG and PNG natively – decoded and embedded directly by the engine, including CMYK JPEG and PNG transparency/indexed color.
+`<img>` works with JPEG and PNG natively – decoded and embedded by daepdf itself, including CMYK JPEG and PNG transparency/indexed color (a PNG that is interlaced, not 8 bits per channel, or transparent by color key goes through the browser's decoder instead, like WebP and AVIF). A wide-gamut image (Display P3, Adobe RGB) keeps its embedded color profile, so it prints with the colors the browser shows.
 
-**WebP and AVIF also work**, decoded by the browser itself rather than the engine – daepdf detects the format from the file's own contents and hands it to the browser's own image decoder, re-embedding the resulting pixels directly.
+**WebP and AVIF also work**, decoded by the browser itself rather than by daepdf – daepdf detects the format from the file's own contents and hands it to the browser's own image decoder, re-embedding the resulting pixels directly, converted to sRGB as the browser shows them.
 
 **No other raster format is supported.** GIF, BMP, ICO, and TIFF are detected and skipped rather than embedded, valid file or not – a `<img>`/background-image pointing at one of these is silently omitted from the export.
 
@@ -912,9 +976,9 @@ daepdf officially supports exactly 4 raster image formats: **JPEG, PNG, WebP, an
 
 `object-fit` (`cover`, `contain`, `fill`, `none`, `scale-down`) and `object-position` on `<img>` work as expected, including clipping to the element's own border-radius.
 
-`background-image` supports everything you'd expect from the browser: `background-size` (including `cover`/`contain`), `background-position`, `background-repeat` (including `repeat-x`/`repeat-y`), `background-origin`, and `background-clip` (`border-box`/`padding-box`/`content-box`). `background-attachment: fixed` is also supported, with its print-appropriate meaning: the image anchors to the *page*, repeating at the same position on every page it spans, rather than to the browser viewport.
+`background-image` supports everything you'd expect from the browser: `background-size` (including `cover`/`contain`), `background-position`, `background-repeat` (including `repeat-x`/`repeat-y`, `round` and `space`), `background-origin`, and `background-clip` (`border-box`/`padding-box`/`content-box`). `background-attachment: fixed` is also supported, with its print-appropriate meaning: the image anchors to the *page*, repeating at the same position on every page it spans, rather than to the browser viewport.
 
-`border-image` (source/slice/width/outset/repeat) works too – full 9-slice image borders, with `stretch`/`repeat`/`round`/`space` tiling on each edge. The source can be a `url()` image or a CSS gradient (linear, radial, or conic) – a gradient border-image has no intrinsic size of its own, so it's rendered at the border area's own size.
+`border-image` (source/slice/width/outset/repeat) works too – full 9-slice image borders, with `stretch`/`repeat`/`round`/`space` tiling on each edge. The source can be a `url()` image or a CSS gradient (linear, radial, or conic) – a gradient border-image has no intrinsic size of its own, so it's rendered at the border area's own size. A cross-origin `url()` source needs CORS headers; without them the border image is skipped.
 
 ---
 
@@ -922,7 +986,7 @@ daepdf officially supports exactly 4 raster image formats: **JPEG, PNG, WebP, an
 
 Both `<img src="logo.svg">` and inline `<svg>` elements are converted to real vector paths in the PDF automatically, whenever the SVG's contents allow it – paths, basic shapes, strokes, fills, nested transforms, linear/radial gradients, and `<use href="#id">` references (the common icon-sprite pattern) all convert cleanly, keeping the output crisp at any zoom level and small in file size.
 
-An SVG that uses a feature with no vector equivalent here – `<filter>`, `<mask>`, `<pattern>`, `<clipPath>`, `<foreignObject>`, `<text>`, a nested raster `<image>`, or CSS `<style>`-block-driven fill/stroke – falls back to a high-resolution raster embed automatically for that whole SVG. Nothing to configure either way; you always get the best available representation.
+An SVG that uses a feature with no vector equivalent here – `<filter>`, `<mask>`, `<pattern>`, `<clipPath>`, `<foreignObject>`, `<text>`, a nested raster `<image>`, a nested `<svg>`, a `<style>` block, a gradient stroke, or a gradient fill in user-space units or inherited through `href` (as Figma, Illustrator and Inkscape export) – falls back to a high-resolution raster embed automatically for that whole SVG. Nothing to configure either way; you always get the best available representation.
 
 ---
 
@@ -971,7 +1035,7 @@ import pdf from 'daeepdf'
 import { buildInvoiceHTML } from './invoiceTemplate.js'
 import type { InvoiceData } from './invoiceTemplate.js'
 
-// Module-level flag -- shared across all calls to this function
+// Module-level flag – shared across all calls to this function
 let _exporting = false
 
 interface ExportCallbacks {
@@ -1020,7 +1084,7 @@ In SvelteKit, any code inside `<script>` tags in `.svelte` files runs on both se
   let exportPDF: (() => Promise<void>) | null = null
 
   onMount(async () => {
-    // Dynamic import -- only runs in the browser
+    // Dynamic import – only runs in the browser
     const { downloadInvoice } = await import('$lib/pdf/pdfUtils.js')
     exportPDF = () => downloadInvoice(data, {
       onStart: () => loading = true,
@@ -1077,14 +1141,16 @@ In Nuxt 3 (or any Vue SSR setup), use `onMounted` and a dynamic import:
 
 ```vue
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, shallowRef, onMounted } from 'vue'
 
+const props    = defineProps<{ data: InvoiceData }>()
 const loading  = ref(false)
-let exportFn: (() => Promise<void>) | null = null
+// a ref, so the button enables once the import lands
+const exportFn = shallowRef<(() => Promise<void>) | null>(null)
 
 onMounted(async () => {
   const { downloadInvoice } = await import('~/lib/pdf/pdfUtils')
-  exportFn = () => downloadInvoice(props.data, {
+  exportFn.value = () => downloadInvoice(props.data, {
     onStart: () => { loading.value = true },
     onDone:  () => { loading.value = false },
     onError: (msg) => alert(msg),
@@ -1092,7 +1158,7 @@ onMounted(async () => {
 })
 
 async function handleClick() {
-  await exportFn?.()
+  await exportFn.value?.()
 }
 </script>
 
@@ -1120,7 +1186,7 @@ Encryption uses AES-256 (the modern PDF 2.0 standard security handler), not the 
 The easiest way to set permissions. Pass a string as the fourth argument to `pdf.download()`:
 
 ```ts
-// Print and copy -- nothing else
+// Print and copy – nothing else
 await pdf.download(html, 'A4', 'file.pdf', 'read-only')
 
 // Same as read-only
@@ -1129,10 +1195,10 @@ await pdf.download(html, 'A4', 'file.pdf', 'printable')
 // Print, copy, and fill interactive forms
 await pdf.download(html, 'A4', 'file.pdf', 'fillable')
 
-// Completely locked -- no printing, no copying, nothing
+// Completely locked – no printing, no copying, nothing
 await pdf.download(html, 'A4', 'file.pdf', 'locked')
 
-// No encryption at all -- fully open PDF
+// No encryption at all – fully open PDF
 await pdf.download(html, 'A4', 'file.pdf', 'open')
 ```
 
@@ -1151,7 +1217,7 @@ If you need fine-grained control:
 ```ts
 await pdf.download(html, 'A4', 'file.pdf', {
   userPassword:  'secret',      // PDF viewer prompts for this on open; omit or use '' for no prompt
-  ownerPassword: 'ownerpass',   // controls permission settings; defaults to '' if omitted
+  ownerPassword: 'ownerpass',   // controls permission settings; a random one if omitted
   permissions: {
     print:     true,
     copy:      false,
@@ -1161,6 +1227,8 @@ await pdf.download(html, 'A4', 'file.pdf', {
   },
 })
 ```
+
+A permission you leave out of `permissions` is allowed – only the ones set to `false` are blocked. List every permission you want to restrict.
 
 ### Disable encryption entirely
 
@@ -1173,7 +1241,7 @@ await pdf.download(html, 'A4', 'file.pdf', null)
 
 Both produce a completely unencrypted PDF – no `/Encrypt` dictionary at all, openable and editable in any viewer with no restrictions.
 
-Note that `pdfA: true` (see [Accessibility and PDF/A](#accessibility-and-pdfa)) requires this – PDF/A does not allow encryption at all.
+`pdfA: true` (see [Accessibility, PDF/A and PDF/UA](#accessibility-pdfa-and-pdfua)) always produces an unencrypted file – PDF/A does not allow encryption at all.
 
 ### Default – omit the argument
 
@@ -1218,7 +1286,7 @@ const filename = `${pdf.name(user.name)}_Invoice.pdf`
 
 ### Scope your CSS
 
-Never use `body`, `*`, or `html` selectors in template CSS. Scope everything to a root wrapper class. This prevents your template styles from leaking out and affecting the rest of your app during the measurement phase.
+Scope template rules under a root wrapper class. Template CSS can't leak into your app, but your app's stylesheets do apply to the template, and scoped rules win over app-wide element and class rules.
 
 ---
 
@@ -1226,7 +1294,7 @@ Never use `body`, `*`, or `html` selectors in template CSS. Scope everything to 
 
 daepdf works on mobile browsers – iOS Safari, Chrome for Android, Samsung Internet, and others.
 
-**The export always runs at the full desktop page size.** On mobile, screen width is narrow, but daepdf renders at the full PDF width (595pt for A4) regardless. The user gets the proper desktop-layout document, not a zoomed-out version of a mobile layout.
+**The export always runs at the full desktop page size.** On mobile, screen width is narrow, but daepdf renders at the full PDF width (595pt for A4) regardless. Media queries and `vw`/`vh` in your template and your app's CSS see that page width too, so a responsive template never switches to its phone layout in the PDF. The user gets the proper desktop-layout document, not a zoomed-out version of a mobile layout.
 
 **Thin elements are handled correctly.** Ruled lines, borders, and dividers with sub-pixel heights are captured even when the browser reports their height as less than 1px. daepdf only skips an element if both its width and height are near-zero – so a full-width divider is always included.
 
@@ -1267,6 +1335,8 @@ import type {
   SecurityPreset,
   SecurityOption,
   RenderExtras,
+  HTMLToPDFOptions,
+  FontBridgeMap,
 } from 'daeepdf'
 ```
 
@@ -1353,6 +1423,32 @@ interface RenderExtras {
   footer?:      (page: number, totalPages: number) => string
   taggedPdf?:   boolean
   pdfA?:        boolean
+  pdfUA?:       boolean
+}
+```
+
+### `HTMLToPDFOptions`
+
+The options object for [`renderHTMLtoPDF()`](#renderhtmltopdfhtml-config-options-fonts):
+
+```ts
+interface HTMLToPDFOptions {
+  metadata?:  PDFMetadata
+  security?:  PDFSecurity | null
+  bookmarks?: BookmarkEntry[]
+  header?:    (page: number, totalPages: number) => string
+  footer?:    (page: number, totalPages: number) => string
+  taggedPdf?: boolean
+  pdfA?:      boolean
+  pdfUA?:     boolean
+}
+```
+
+### `FontBridgeMap`
+
+```ts
+interface FontBridgeMap {
+  [cssFontFamily: string]: { name: string; style: string; weight: number }
 }
 ```
 
@@ -1405,25 +1501,27 @@ await pdf.download(buildQuoteHTML(quote), 'A4', filename)
 
 ### The PDF downloads but it's blank
 
-Your template HTML is not reaching the engine. Check:
+Either your template HTML isn't reaching daepdf, or its text has no font to print in. Check:
 
 - The string returned by your template function is not empty
 - There are no uncaught exceptions before `pdf.download()` is called
 - The root element has padding or visible content (a zero-height container produces a blank page)
+- The text's `font-family` names a font your template declares with `@font-face`; text in an undeclared font is left out, and a console warning names the font (see [Fonts](#fonts))
 
 ### Fonts are not showing in the PDF
 
+- The font must be declared with `@font-face` in the template itself (and in each `header`/`footer` string that uses it); a console warning names any font that isn't
 - The font file URL in `@font-face` must be reachable from the browser at export time
 - Check the network tab in DevTools for a failed font fetch
 - The font must be in your public folder and served over HTTP/HTTPS
 
 ### Styles from my app are affecting the template
 
-You are using a global CSS selector (`body`, `*`, `html`) in your template. Scope everything to a root wrapper class. See the [CSS](#css) section.
+Your app's stylesheets are copied into the frame the template is laid out in, so app-wide rules reach template elements just as they reach your own pages. That's what lets templates use your app's classes. Scope the template's rules under a root wrapper class so they win where they need to. See the [CSS](#css) section.
 
 ### The PDF looks different from the browser preview
 
-- Check for CSS that uses `vw`, `vh`, or `%` relative to the viewport – these will be computed at browser window size during measurement and may not match your intended PDF dimensions. Use `pt` instead.
+- `vw`, `vh` and `@media` resolve against the page's content area – the page minus any header/footer bands – not your browser window. For A4 portrait with no header or footer, that's 794×1123px.
 - `position: fixed` is fully supported and repeats correctly on every page – if something still looks off, check that the fixed element's own size and position are what you expect at the PDF's actual page dimensions, not your current viewport size.
 
 ### Mobile: section dividers are missing in the export
@@ -1436,7 +1534,7 @@ Add `.page a { color: inherit; text-decoration: none; }` to your template CSS. S
 
 ### "SyntaxError: Importing binding name is not found"
 
-You are importing a named export from `'daeepdf'` that is not exported. Check the [TypeScript types](#typescript-types) section for the full list of available named exports, and the [API reference](#api-reference) for functions (`previewHTML`, `renderHTMLtoPDF`, `escapeHtml`). The default export (`pdf`) covers all runtime functionality.
+You are importing a named export from `'daeepdf'` that is not exported. Check the [TypeScript types](#typescript-types) section for the full list of available named exports, and the [API reference](#api-reference) for functions (`previewHTML`, `renderHTMLtoPDF`, `escapeHtml`). Everything else is on the default export, `pdf`: `download`, `render`, `warmup` and `name`.
 
 ### daepdf causes an error during SSR / server build
 

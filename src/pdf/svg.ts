@@ -62,16 +62,15 @@ export async function rasterizeSVGs(commands: DrawCommand[]): Promise<void> {
   const keyOf     = (c: ImageCommand) => `${_hashBytes(c.src)}|${c.w}|${c.h}`
   const jobs: Array<{ cmd: ImageCommand; key: string }> = []
 
-  for (const cmd of commands) {
-    if (cmd.type !== 'image') continue
-    const c = cmd as ImageCommand
+  for (const c of commands) {
+    if (c.type !== 'image') continue
     if (c.format !== 'svg') continue
     const key = keyOf(c)
     if (!byContent.has(key)) {
       // one unloadable SVG must not reject the Promise.all below and kill the export —
       // resolve to empty bytes so the command keeps format 'svg' and applyToPDF skips it
       byContent.set(key, svgToPng(c.src, c.w, c.h).catch(err => {
-        console.warn('[daepdf] SVG rasterization failed — image skipped.', err)
+        console.warn('[daepdf] SVG rasterization failed – image skipped.', err)
         return new Uint8Array(0)
       }))
     }

@@ -77,40 +77,44 @@ function keyExpansion(key: Uint8Array, nk: number, nr: number): Uint32Array {
   return w
 }
 
-function addRoundKey(state: Uint8Array, w: Uint32Array, round: number): void {
-  for (let c = 0; c < 4; c++) {
-    const word = w[round * 4 + c]!
-    const i = c * 4
-    state[i]     = state[i]!     ^ ((word >>> 24) & 0xff)
-    state[i + 1] = state[i + 1]! ^ ((word >>> 16) & 0xff)
-    state[i + 2] = state[i + 2]! ^ ((word >>> 8) & 0xff)
-    state[i + 3] = state[i + 3]! ^ (word & 0xff)
-  }
+// T-tables fold SubBytes, ShiftRows and MixColumns into four lookups per column: TE0[x] is
+// the column (2·S[x], S[x], S[x], 3·S[x]) as a big-endian word, TE1..TE3 its byte rotations
+const xtime = (b: number): number => ((b << 1) ^ (b & 0x80 ? 0x1b : 0)) & 0xff
+const TE0 = new Uint32Array(256), TE1 = new Uint32Array(256), TE2 = new Uint32Array(256), TE3 = new Uint32Array(256)
+for (let i = 0; i < 256; i++) {
+  const s = SBOX[i]!, s2 = xtime(s)
+  const t = ((s2 << 24) | (s << 16) | (s << 8) | (s2 ^ s)) >>> 0
+  TE0[i] = t
+  TE1[i] = ((t >>> 8) | (t << 24)) >>> 0
+  TE2[i] = ((t >>> 16) | (t << 16)) >>> 0
+  TE3[i] = ((t >>> 24) | (t << 8)) >>> 0
 }
 
-function subBytes(state: Uint8Array): void {
-  for (let i = 0; i < 16; i++) state[i] = sbox(state[i]!)
+const be32 = (b: Uint8Array, o: number): number => ((b[o]! << 24) | (b[o + 1]! << 16) | (b[o + 2]! << 8) | b[o + 3]!) >>> 0
+function putBe32(b: Uint8Array, o: number, v: number): void {
+  b[o] = v >>> 24; b[o + 1] = (v >>> 16) & 0xff; b[o + 2] = (v >>> 8) & 0xff; b[o + 3] = v & 0xff
 }
 
-// state is column-major (state[c*4+r]); ShiftRows moves row r left by r
-function shiftRows(state: Uint8Array): void {
-  const s = state.slice()
-  for (let r = 1; r < 4; r++) {
-    for (let c = 0; c < 4; c++) {
-      state[c * 4 + r] = s[((c + r) % 4) * 4 + r]!
-    }
+// One block in place in `s` (four big-endian column words), FIPS-197 §5.1 via the T-tables
+function encryptWords(s: Uint32Array, w: Uint32Array, nr: number): void {
+  let s0 = s[0]! ^ w[0]!, s1 = s[1]! ^ w[1]!, s2 = s[2]! ^ w[2]!, s3 = s[3]! ^ w[3]!
+  let k = 4
+  for (let round = 1; round < nr; round++, k += 4) {
+    const t0 = TE0[s0 >>> 24]! ^ TE1[(s1 >>> 16) & 0xff]! ^ TE2[(s2 >>> 8) & 0xff]! ^ TE3[s3 & 0xff]! ^ w[k]!
+    const t1 = TE0[s1 >>> 24]! ^ TE1[(s2 >>> 16) & 0xff]! ^ TE2[(s3 >>> 8) & 0xff]! ^ TE3[s0 & 0xff]! ^ w[k + 1]!
+    const t2 = TE0[s2 >>> 24]! ^ TE1[(s3 >>> 16) & 0xff]! ^ TE2[(s0 >>> 8) & 0xff]! ^ TE3[s1 & 0xff]! ^ w[k + 2]!
+    const t3 = TE0[s3 >>> 24]! ^ TE1[(s0 >>> 16) & 0xff]! ^ TE2[(s1 >>> 8) & 0xff]! ^ TE3[s2 & 0xff]! ^ w[k + 3]!
+    s0 = t0; s1 = t1; s2 = t2; s3 = t3
   }
+  s[0] = lastRound(s0, s1, s2, s3, w[k]!)
+  s[1] = lastRound(s1, s2, s3, s0, w[k + 1]!)
+  s[2] = lastRound(s2, s3, s0, s1, w[k + 2]!)
+  s[3] = lastRound(s3, s0, s1, s2, w[k + 3]!)
 }
 
-function mixColumns(state: Uint8Array): void {
-  for (let c = 0; c < 4; c++) {
-    const i = c * 4
-    const a0 = state[i]!, a1 = state[i+1]!, a2 = state[i+2]!, a3 = state[i+3]!
-    state[i]   = gmul(a0,2) ^ gmul(a1,3) ^ a2 ^ a3
-    state[i+1] = a0 ^ gmul(a1,2) ^ gmul(a2,3) ^ a3
-    state[i+2] = a0 ^ a1 ^ gmul(a2,2) ^ gmul(a3,3)
-    state[i+3] = gmul(a0,3) ^ a1 ^ a2 ^ gmul(a3,2)
-  }
+// the final round: SubBytes and ShiftRows only, no MixColumns
+function lastRound(a: number, b: number, c: number, d: number, rk: number): number {
+  return (((SBOX[a >>> 24]! << 24) | (SBOX[(b >>> 16) & 0xff]! << 16) | (SBOX[(c >>> 8) & 0xff]! << 8) | SBOX[d & 0xff]!) ^ rk) >>> 0
 }
 
 // keyExpansion is expensive (SBOX lookups + XORs across up to 60 words for
@@ -132,29 +136,6 @@ function scheduleFor(key: Uint8Array): { w: Uint32Array; nr: number } {
   return { w: cachedSchedule!, nr: cachedNr }
 }
 
-// key must be 16 (AES-128) or 32 (AES-256) bytes; block is exactly 16 bytes,
-// modified in place
-function encryptBlock(block: Uint8Array, key: Uint8Array): void {
-  const { w, nr } = scheduleFor(key)
-
-  // FIPS-197's state[r][c] = in[r + 4c] maps to this file's state[c*4+r]
-  // convention with the SAME index arithmetic (c*4+r === r+4c) — the input
-  // bytes are already in this layout, so no reordering is needed here
-  const state = block.slice()
-
-  addRoundKey(state, w, 0)
-  for (let round = 1; round < nr; round++) {
-    subBytes(state); shiftRows(state); mixColumns(state); addRoundKey(state, w, round)
-  }
-  subBytes(state); shiftRows(state); addRoundKey(state, w, nr)
-
-  block.set(state)
-}
-
-function xorInto(a: Uint8Array, b: Uint8Array): void {
-  for (let i = 0; i < a.length; i++) a[i] = a[i]! ^ b[i]!
-}
-
 // PKCS#7 padding (PDF spec Algorithm 8) — always adds a full block of
 // padding when data is already block-aligned, per spec (not an optimization
 // to skip it in that case)
@@ -169,13 +150,12 @@ function pkcs7Pad(data: Uint8Array): Uint8Array {
 export function aesCbcEncrypt(key: Uint8Array, iv: Uint8Array, data: Uint8Array, pad: boolean): Uint8Array {
   const input = pad ? pkcs7Pad(data) : data
   const out = new Uint8Array(input.length)
-  let prev = iv.slice()
-  for (let off = 0; off < input.length; off += 16) {
-    const block = input.slice(off, off + 16)
-    xorInto(block, prev)
-    encryptBlock(block, key)
-    out.set(block, off)
-    prev = block
+  const { w, nr } = scheduleFor(key)
+  const s = new Uint32Array([be32(iv, 0), be32(iv, 4), be32(iv, 8), be32(iv, 12)])
+  for (let off = 0; off + 16 <= input.length; off += 16) {
+    for (let c = 0; c < 4; c++) s[c] = (s[c]! ^ be32(input, off + c * 4)) >>> 0
+    encryptWords(s, w, nr)
+    for (let c = 0; c < 4; c++) putBe32(out, off + c * 4, s[c]!)
   }
   return out
 }
@@ -183,7 +163,10 @@ export function aesCbcEncrypt(key: Uint8Array, iv: Uint8Array, data: Uint8Array,
 // ECB, single block, no padding — only used for the PDF R6 /Perms field
 // (Algorithm 3.A), which is exactly one 16-byte block by spec
 export function aesEcbEncryptBlock(key: Uint8Array, block: Uint8Array): Uint8Array {
-  const out = block.slice()
-  encryptBlock(out, key)
+  const { w, nr } = scheduleFor(key)
+  const s = new Uint32Array([be32(block, 0), be32(block, 4), be32(block, 8), be32(block, 12)])
+  encryptWords(s, w, nr)
+  const out = new Uint8Array(16)
+  for (let c = 0; c < 4; c++) putBe32(out, c * 4, s[c]!)
   return out
 }

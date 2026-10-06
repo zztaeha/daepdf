@@ -25,16 +25,15 @@ function randomBytes(n: number): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(n))
 }
 
-// ISO 32000-2 Algorithm 2.B — the revision-6 "hardened hash". Genuinely
-// needs SHA-256 AND SHA-384 AND SHA-512 (not just SHA-256): the loop
-// re-hashes its own AES output with whichever of the three a running
-// digest byte selects, at least 64 times, until a data-dependent stop
-// condition. `extra` is the 48-byte U string for owner-password hashing,
-// or empty for a user password (per spec, step (a)).
-function hardenedHash(password: Uint8Array, salt: Uint8Array, extra: Uint8Array): Uint8Array {
+// ISO 32000-2 Algorithm 2.B, the revision-6 "hardened hash": 64+ rounds of AES, then SHA-256/384/512
+// by its output, until a data-dependent stop. Rounds count from 1, as pdf.js and poppler count them;
+// a reader counting from 0 (veraPDF) stops at last byte <= round - 33, never earlier, and `portable`
+// says both agree. `extra`: the 48-byte U string for owner hashes, empty for the user's.
+function hardenedHash(password: Uint8Array, salt: Uint8Array, extra: Uint8Array): { hash: Uint8Array; portable: boolean } {
   let k: Uint8Array = sha256(concatBytes(password, salt, extra))
 
   let round = 0
+  let hash: Uint8Array | null = null
   for (;;) {
     const k1Unit = concatBytes(password, k, extra)
     const k1 = new Uint8Array(k1Unit.length * 64)
@@ -50,9 +49,23 @@ function hardenedHash(password: Uint8Array, salt: Uint8Array, extra: Uint8Array)
     k = mod3 === 0 ? sha256(e) : mod3 === 1 ? sha384(e) : sha512(e)
 
     round++
-    if (round >= 64 && e[e.length - 1]! <= round - 32) break
+    const last = e[e.length - 1]!
+    if (!hash && round >= 64 && last <= round - 32) hash = k.slice(0, 32)
+    if (round >= 64 && last <= round - 33) {
+      const alt = k.slice(0, 32)
+      return { hash: hash!, portable: hash!.every((b, i) => b === alt[i]) }
+    }
   }
-  return k.slice(0, 32)
+}
+
+// A fresh salt and its hash, drawn again in the ~1% of cases where readers that count rounds
+// differently would compute different hashes and reject the file
+function portableHash(password: Uint8Array, extra: Uint8Array): { salt: Uint8Array; hash: Uint8Array } {
+  for (;;) {
+    const salt = randomBytes(8)
+    const { hash, portable } = hardenedHash(password, salt, extra)
+    if (portable) return { salt, hash }
+  }
 }
 
 export interface R6Security {
@@ -75,21 +88,15 @@ export function computeR6Security(userPw: string, ownerPw: string, permissions: 
   const ownerPassword = preparePassword(ownerPw)
   const fileKey = randomBytes(32)
 
-  const uValidationSalt = randomBytes(8)
-  const uKeySalt        = randomBytes(8)
-  const uHash = hardenedHash(userPassword, uValidationSalt, new Uint8Array(0))
-  const u = concatBytes(uHash, uValidationSalt, uKeySalt)
+  const uValidation = portableHash(userPassword, new Uint8Array(0))
+  const uKey        = portableHash(userPassword, new Uint8Array(0))
+  const u = concatBytes(uValidation.hash, uValidation.salt, uKey.salt)
+  const ue = aesCbcEncrypt(uKey.hash, new Uint8Array(16), fileKey, false)
 
-  const uIntermediateKey = hardenedHash(userPassword, uKeySalt, new Uint8Array(0))
-  const ue = aesCbcEncrypt(uIntermediateKey, new Uint8Array(16), fileKey, false)
-
-  const oValidationSalt = randomBytes(8)
-  const oKeySalt        = randomBytes(8)
-  const oHash = hardenedHash(ownerPassword, oValidationSalt, u)
-  const o = concatBytes(oHash, oValidationSalt, oKeySalt)
-
-  const oIntermediateKey = hardenedHash(ownerPassword, oKeySalt, u)
-  const oe = aesCbcEncrypt(oIntermediateKey, new Uint8Array(16), fileKey, false)
+  const oValidation = portableHash(ownerPassword, u)
+  const oKey        = portableHash(ownerPassword, u)
+  const o = concatBytes(oValidation.hash, oValidation.salt, oKey.salt)
+  const oe = aesCbcEncrypt(oKey.hash, new Uint8Array(16), fileKey, false)
 
   // Algorithm 3.A: P (low-order 4 bytes, little-endian) + 0xFFFFFFFF +
   // 'T' (EncryptMetadata always true here, matching the previous R3

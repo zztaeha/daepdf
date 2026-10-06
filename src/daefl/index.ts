@@ -8,8 +8,6 @@
 import { deflateRaw } from './deflate.js'
 import { inflateRawWithEnd, InflateError } from './inflate.js'
 
-export { InflateError }
-
 // Adler-32 (RFC 1950 section 9). 65521 is the largest prime below 2^16; the
 // sums are reduced every 5552 bytes, the most that cannot overflow a 32-bit
 // accumulator.
@@ -82,7 +80,7 @@ export function unzlib(data: Uint8Array, out?: Uint8Array): Uint8Array {
   if (((cmf << 8) | flg) % 31 !== 0) throw new InflateError('daefl: bad zlib header check')
   if (flg & 0x20) throw new InflateError('daefl: preset dictionaries are not supported')
 
-  const { bytes, end } = inflateRawWithEnd(data.subarray(2), out, out?.length ?? 0)
+  const { bytes, end } = inflateRawWithEnd(data.subarray(2), out)
 
   // The trailer is verified when present. Some producers truncate it, and a
   // stream that decoded cleanly is still usable, so a missing one is allowed

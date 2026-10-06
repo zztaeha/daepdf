@@ -1,27 +1,102 @@
 import type {
-  Color, ColorAlpha, Gradient, ConicGradient, BorderRadius, Corner, FontRef,
-  TextCommand, RectCommand, LineCommand, LinkCommand, ClipCommand, ImageCommand, FieldCommand,
+  Color, ColorAlpha, Gradient, ConicGradient, BorderRadius, Corner, FontRef, PathSeg,
+  TextCommand, RectCommand, LineCommand, LinkCommand, ImageCommand, FieldCommand, PathCommand,
 } from '../types/index.js'
+import { LINK_SCHEMES } from '../types/index.js'
 import { measure_string_width } from '../../engine.js'
-import { PX_PER_PT, domRectToPt, paginate, paginateSpan, stackOpacity, stackBlend, type WalkerCtx } from './types.js'
+import { PX_PER_PT, domRectToPt, paginate, paginateSpan, stackOpacity, stackBlend, tagStructAnnot, type WalkerCtx } from './types.js'
 import {
-  parseColorAlpha, parseCSSBoxShadow, parseCSSGradient, parseCSSConicGradient, tileStops,
-  parseBorderRadius, clampRadiusToBox, insetBorderRadius, pxToPt, splitByTopLevelComma, isTransparentColor,
+  parseColorAlpha, parseCSSBoxShadow, parseCSSGradient, parseCSSConicGradient,
+  parseBorderRadius, clampRadiusToBox, insetBorderRadius, pxToPt, splitByTopLevelComma, isTransparentColor, resolveGradientBox,
 } from './css.js'
-import { resolveFontRef, splitByFontCoverage } from './fonts.js'
-import { romanNumeral, alphaLabel, applyCounters, popCounters, resolveContentList } from './counters.js'
+import { isSlanted, resolveFontRef, splitByFontCoverage } from './fonts.js'
+import { counterText } from './counters.js'
 import { hasBorderImage } from './borderimage.js'
+import { emitBgImage, type BgImage } from './images.js'
+import { canvasToPngBytes, fillConic } from './canvaspaint.js'
 
-// also used for text-decoration-style, the only caller that can ever produce
-// 'wavy' — CSS border-style never has that value
 type Side = 'Top' | 'Right' | 'Bottom' | 'Left'
 const perSide = <T>(f: (d: Side) => T): [T, T, T, T] => [f('Top'), f('Right'), f('Bottom'), f('Left')]
 
+// also used for text-decoration-style, the only caller that can ever produce
+// 'wavy' – CSS border-style never has that value
 function normBorderStyle(s: string): 'solid' | 'dashed' | 'dotted' | 'wavy' {
   if (s === 'dashed') return 'dashed'
   if (s === 'dotted') return 'dotted'
   if (s === 'wavy') return 'wavy'
   return 'solid'
+}
+
+const BORDER_3D = new Set(['inset', 'outset', 'groove', 'ridge'])
+
+// A rounded rect as path segments, y down; a corner with either radius at 0 is square
+function roundedRectOps(x: number, y: number, w: number, h: number, r: BorderRadius | undefined): PathSeg[] {
+  const K = 0.5523, a = r?.all ?? 0
+  const c = (k?: Corner): Corner => { const v = k ?? { h: a, v: a }; return v.h > 0 && v.v > 0 ? v : { h: 0, v: 0 } }
+  const tl = c(r?.topLeft), tr = c(r?.topRight), br = c(r?.bottomRight), bl = c(r?.bottomLeft)
+  return [
+    { op: 'm', args: [x + tl.h, y] },
+    { op: 'l', args: [x + w - tr.h, y] },
+    { op: 'c', args: [x + w - tr.h + tr.h * K, y, x + w, y + tr.v - tr.v * K, x + w, y + tr.v] },
+    { op: 'l', args: [x + w, y + h - br.v] },
+    { op: 'c', args: [x + w, y + h - br.v + br.v * K, x + w - br.h + br.h * K, y + h, x + w - br.h, y + h] },
+    { op: 'l', args: [x + bl.h, y + h] },
+    { op: 'c', args: [x + bl.h - bl.h * K, y + h, x, y + h - bl.v + bl.v * K, x, y + h - bl.v] },
+    { op: 'l', args: [x, y + tl.v] },
+    { op: 'c', args: [x, y + tl.v - tl.v * K, x + tl.h - tl.h * K, y, x + tl.h, y] },
+  ]
+}
+
+// Chrome paints an unstyled control natively (1px gray border, 2px corners; a gray square or
+// circle for a checkbox or radio) whatever its UA border says, until a border or background is set
+const NATIVE_BORDER: ColorAlpha = [118, 118, 118, 255]
+const BUTTON_TYPES = new Set(['button', 'submit', 'reset'])
+function nativeControl(el: Element, s: CSSStyleDeclaration): 'box' | 'checkbox' | 'radio' | null {
+  if ((s as any).appearance === 'none') return null
+  const tag = el.tagName.toUpperCase()
+  const type = tag === 'INPUT' ? (el as HTMLInputElement).type : ''
+  if (type === 'checkbox' || type === 'radio') return s.borderTopStyle === 'none' ? type : null
+  if (tag !== 'INPUT' && tag !== 'BUTTON' && tag !== 'SELECT' && tag !== 'TEXTAREA') return null
+  const uaBackground = tag === 'BUTTON' || BUTTON_TYPES.has(type) ? 'rgb(239, 239, 239)' : 'rgb(255, 255, 255)'
+  if (s.backgroundColor !== uaBackground || s.backgroundImage !== 'none') return null
+  const ua = s.borderTopStyle === 'inset' || s.borderTopStyle === 'outset' ||
+    (s.borderTopStyle === 'solid' && s.borderTopWidth === '1px' && s.borderTopColor === 'rgb(118, 118, 118)')
+  return ua ? 'box' : null
+}
+
+// Blink's Color::Dark()/Light(): scale the channels so the brightest moves by 0.33
+const scaleRGB = ([r, g, b, a]: ColorAlpha, k: number): ColorAlpha =>
+  [Math.floor(r / 255 * k * 255.99998), Math.floor(g / 255 * k * 255.99998), Math.floor(b / 255 * k * 255.99998), a]
+function darker(c: ColorAlpha): ColorAlpha {
+  const v = Math.max(c[0], c[1], c[2]) / 255
+  return v === 1 && c[0] === c[1] && c[1] === c[2] ? [171, 171, 171, c[3]] : scaleRGB(c, v ? Math.max(0, (v - 0.33) / v) : 0)
+}
+function lighter(c: ColorAlpha): ColorAlpha {
+  const v = Math.max(c[0], c[1], c[2]) / 255
+  return v ? scaleRGB(c, Math.min(1, v + 0.33) / v) : [84, 84, 84, c[3]]
+}
+const luminance = ([r, g, b]: ColorAlpha): number => {
+  const lin = (ch: number) => { const v = ch / 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4 }
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+const TOO_DARK  = luminance([32, 32, 32, 255])
+const TOO_LIGHT = luminance([235, 235, 235, 255])
+
+// The shadowed and lit edge colors Chrome paints for inset/outset/groove/ridge
+function border3dShades(c: ColorAlpha): { dark: ColorAlpha; light: ColorAlpha } {
+  const lum = luminance(c)
+  if (lum <= TOO_DARK) { const dark = lighter(c); return { dark, light: lighter(dark) } }
+  return { dark: darker(c), light: lum > TOO_LIGHT ? c : lighter(c) }
+}
+
+// Bands of one side as [from, to] depth fractions, each shadowed or lit: top/left are
+// shadowed for inset, bottom/right for outset; groove and ridge split the width in two
+function border3dBands(style: string, side: number): [number, number, boolean][] {
+  const topLeft = side === 0 || side === 3
+  if (style === 'inset')  return [[0, 1, topLeft]]
+  if (style === 'outset') return [[0, 1, !topLeft]]
+  const outerDark = style === 'groove' ? topLeft : !topLeft
+  return [[0, 0.5, outerDark], [0.5, 1, !outerDark]]
 }
 
 // A3 (bidi): strong-RTL Unicode blocks (Hebrew, Arabic + its extensions/
@@ -35,6 +110,27 @@ const RTL_RANGES: [number, number][] = [
 ]
 function isStrongRTL(cp: number): boolean {
   return RTL_RANGES.some(([a, b]) => cp >= a && cp <= b)
+}
+
+// A character's own direction: strong RTL script, or digits and other letters (which run left
+// to right even inside RTL text); null for neutrals, which take their neighbors' direction
+function charDirection(ch: string): 'ltr' | 'rtl' | null {
+  // digits first: Arabic-Indic ones sit inside the RTL script ranges yet still run left to right
+  if (/\p{Nd}/u.test(ch)) return 'ltr'
+  if (isStrongRTL(ch.codePointAt(0)!)) return 'rtl'
+  return /\p{L}/u.test(ch) ? 'ltr' : null
+}
+
+// `text` split where the direction changes; neutrals join the run before them (or after,
+// at the start), and an all-neutral text takes the paragraph's direction
+function directionRuns(text: string, paraDir: 'ltr' | 'rtl'): { text: string; dir: 'ltr' | 'rtl' }[] {
+  const runs: { text: string; dir: 'ltr' | 'rtl' | null }[] = []
+  for (const ch of text) {
+    const dir = charDirection(ch), last = runs.at(-1)
+    if (last && (dir === null || last.dir === null || dir === last.dir)) { last.text += ch; last.dir ??= dir; continue }
+    runs.push({ text: ch, dir })
+  }
+  return runs.map(r => ({ text: r.text, dir: r.dir ?? paraDir }))
 }
 
 // True when `text` mixes a strong-RTL script with a strong-LTR letter — the
@@ -75,51 +171,6 @@ function combineOpacity(base: number | undefined, extra: number): number | undef
   return combined < 1 ? combined : undefined
 }
 
-// Parts of a gradient only resolve against the box it paints: corner keywords
-// (spec: the gradient line runs perpendicular to the diagonal joining the two
-// neighboring corners — the parse-time 45° multiple is only correct for squares)
-// and px-positioned stops (fractions of the gradient-line length).
-export function resolveGradientBox(gradient: Gradient, w: number, h: number): Gradient {
-  if (w <= 0 || h <= 0) return gradient
-
-  if (gradient.type === 'linear' && gradient.corner) {
-    const a = Math.atan2(h, w) * 180 / Math.PI
-    const cornerAngle: Record<string, number> = {
-      'top right': a, 'bottom right': 180 - a, 'bottom left': 180 + a, 'top left': 360 - a,
-    }
-    gradient = { ...gradient, angle: cornerAngle[gradient.corner] ?? gradient.angle }
-  }
-
-  if (gradient.stops.some(st => st.posPx !== undefined)) {
-    let linePt: number
-    if (gradient.type === 'linear') {
-      const rad = gradient.angle * Math.PI / 180
-      linePt = Math.abs(w * Math.sin(rad)) + Math.abs(h * Math.cos(rad))
-    } else {
-      // farthest-corner radius, matching the shading's ending circle
-      const cxPt = (gradient.cx ?? 0.5) * w
-      const cyPt = (gradient.cy ?? 0.5) * h
-      linePt = Math.hypot(Math.max(cxPt, w - cxPt), Math.max(cyPt, h - cyPt))
-    }
-    if (linePt > 0) {
-      gradient = { ...gradient, stops: gradient.stops.map(st =>
-        st.posPx !== undefined
-          ? { color: st.color, position: (st.posPx / PX_PER_PT) / linePt }
-          : st
-      ) }
-    }
-  }
-
-  // repeating-linear/radial-gradient: tile the stop pattern across [0,1] — the
-  // domain is fractional position along the gradient line (linear) or shading
-  // radius (radial), so one tiling function covers both.
-  if (gradient.repeating) {
-    gradient = { ...gradient, repeating: undefined, stops: tileStops(gradient.stops, true) } as Gradient
-  }
-
-  return gradient
-}
-
 // Conic gradients have no PDF shading equivalent (axial/radial only) — rasterize
 // through a canvas at 3× (≈216 dpi, matching svg.ts). Cached by definition + size;
 // same-page repeats (badges, chips) reuse the bytes and the PDF embeds them once.
@@ -127,42 +178,20 @@ const _conicCache = new Map<string, Uint8Array | null>()
 
 function rasterizeConic(cg: ConicGradient, wPt: number, hPt: number): Uint8Array | null {
   if (wPt <= 0 || hPt <= 0) return null
-  const key = `${cg.fromDeg}|${cg.cx}|${cg.cy}|${cg.repeating ?? false}|${cg.stops.map(st => `${st.position}:${st.color}`).join(',')}|${wPt.toFixed(2)}|${hPt.toFixed(2)}`
+  const key = `${JSON.stringify(cg)}|${wPt.toFixed(2)}|${hPt.toFixed(2)}`
   const hit = _conicCache.get(key)
   if (hit !== undefined) return hit
 
   let out: Uint8Array | null = null
-  try {
-    const dpr = 3
-    const canvas  = document.createElement('canvas')
-    canvas.width  = Math.max(1, Math.round(wPt * dpr))
-    canvas.height = Math.max(1, Math.round(hPt * dpr))
-    const c2d = canvas.getContext('2d')
-    if (c2d && typeof c2d.createConicGradient === 'function') {
-      // canvas measures the start angle from the +x axis, CSS from 12 o'clock
-      const grad = c2d.createConicGradient(
-        (cg.fromDeg - 90) * Math.PI / 180,
-        cg.cx * canvas.width, cg.cy * canvas.height,
-      )
-      // repeating-conic-gradient: canvas has no native repeat for conic stops,
-      // so the same [0,1]-domain tiling used for linear/radial pre-expands them
-      const stops = tileStops(cg.stops, cg.repeating)
-      for (const st of stops) {
-        const [r, g, b, a] = st.color
-        grad.addColorStop(Math.min(1, Math.max(0, st.position)), `rgba(${r},${g},${b},${a / 255})`)
-      }
-      c2d.fillStyle = grad
-      c2d.fillRect(0, 0, canvas.width, canvas.height)
-      const dataUrl = canvas.toDataURL('image/png')
-      const comma   = dataUrl.indexOf(',')
-      if (comma >= 0) {
-        const bin = atob(dataUrl.slice(comma + 1))
-        out = new Uint8Array(bin.length)
-        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
-      }
-    }
-  } catch { out = null }
-
+  const dpr = 3
+  const canvas  = document.createElement('canvas')
+  canvas.width  = Math.max(1, Math.round(wPt * dpr))
+  canvas.height = Math.max(1, Math.round(hPt * dpr))
+  const c2d = canvas.getContext('2d')
+  if (c2d && typeof c2d.createConicGradient === 'function') {
+    fillConic(c2d, cg, canvas.width, canvas.height, wPt, hPt)
+    out = canvasToPngBytes(canvas)
+  }
   _conicCache.set(key, out)
   return out
 }
@@ -182,7 +211,7 @@ function suppressRadiusSide(radius: BorderRadius | undefined, suppressLeft: bool
   return { topLeft: tl, topRight: tr, bottomRight: br, bottomLeft: bl }
 }
 
-export function emitBox(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx): void {
+export function emitBox(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx, bgImages?: Map<number, BgImage>): void {
   const isInline = s.display === 'inline'
   const rects    = isInline
     ? Array.from((el as HTMLElement).getClientRects())
@@ -218,13 +247,20 @@ export function emitBox(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx): vo
     // (verified directly against rendered output; see task-map.md's B12 notes),
     // so no corner suppression is needed for that case.
     const fragmented    = isInline && rects.length > 1 && boxDecorationBreak === 'slice'
-    const suppressLeft  = fragmented && rectIndex > 0
-    const suppressRight = fragmented && rectIndex < rects.length - 1
-    const radius = suppressRadiusSide(baseRadius, suppressLeft, suppressRight)
+    // the cut sides are the start of every fragment but the first and the end of every
+    // one but the last; in RTL the start is the right side
+    const startCut      = fragmented && rectIndex > 0
+    const endCut        = fragmented && rectIndex < rects.length - 1
+    const suppressLeft  = s.direction === 'rtl' ? endCut : startCut
+    const suppressRight = s.direction === 'rtl' ? startCut : endCut
+    const native = nativeControl(el, s)
+    const radius = native === 'radio' ? { all: Math.min(w, h) / 2 }
+      : native ? { all: pxToPt('2px') }
+      : suppressRadiusSide(baseRadius, suppressLeft, suppressRight)
 
-    const bWidths       = perSide(d => pxToPt((s as any)[`border${d}Width`] ?? '0px'))
-    const bColorAlphas  = perSide(d => parseColorAlpha((s as any)[`border${d}Color`] ?? ''))
-    const bStyles       = perSide(d => (s as any)[`border${d}Style`] as string ?? 'none')
+    const bWidths       = perSide(d => native ? pxToPt('1px') : pxToPt((s as any)[`border${d}Width`]))
+    const bColorAlphas  = perSide(d => native ? NATIVE_BORDER : parseColorAlpha((s as any)[`border${d}Color`]))
+    const bStyles       = perSide(d => native ? 'solid' : (s as any)[`border${d}Style`] as string)
 
     const allSame = bWidths.every(v => v === bWidths[0]) &&
       bStyles.every(v => v === bStyles[0]) &&
@@ -236,7 +272,8 @@ export function emitBox(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx): vo
     // A fragmented (sliced) box also forces the line branch regardless of style —
     // border_ring always draws all four sides as one ring, with no way to omit
     // just the cut side(s) the way the per-side line loop below can.
-    const uniformSolid = !fragmented && allSame && bStyles[0] !== 'dashed' && bStyles[0] !== 'dotted' && bStyles[0] !== 'double'
+    const uniformSolid = !fragmented && allSame && bStyles[0] !== 'dashed' && bStyles[0] !== 'dotted' && bStyles[0] !== 'double' &&
+      !BORDER_3D.has(bStyles[0])
 
     // background-clip: 'text' can't clip a box fill to glyph outlines in a PDF — the
     // box paints nothing but its shadow (captureTextNode substitutes the text color
@@ -276,15 +313,9 @@ export function emitBox(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx): vo
       }
     }
 
-    // CSS paints background-color first, then image layers LAST → FIRST; each
-    // layer clips to its own background-clip value. Gradient/conic layers are
-    // collected here and emitted between the color fill and the border commands
-    // — borders paint above backgrounds. url() layers are handled in walk.ts
-    // (async fetch), likewise in reverse order. Parameterized on the box's
-    // effective height so box-decoration-break:clone (below) can recompute this
-    // per page-fragment, insetting from THAT fragment's own edges — the common
-    // (non-clone) case calls this once, exactly as before the refactor.
-    interface BgLayer { gradient?: Gradient; conicSrc?: Uint8Array; box: { dx: number; dy: number; w: number; h: number; radius?: BorderRadius | undefined } }
+    // Background color, then image layers last to first, each clipped to its own
+    // background-clip box, all under the border; per height, for clone fragments
+    interface BgLayer { gradient?: Gradient; conicSrc?: Uint8Array; url?: BgImage; index?: number; box: { dx: number; dy: number; w: number; h: number; radius?: BorderRadius | undefined } }
     const computeGeom = (effH: number) => {
       const clipBoxFor = (kind: string) => {
         const box = { dx: 0, dy: 0, w, h: effH, radius }
@@ -311,6 +342,12 @@ export function emitBox(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx): vo
         for (let i = layerList.length - 1; i >= 0; i--) {
           const kind = bgClipList[i % bgClipList.length] ?? 'border-box'
           if (kind === 'text') continue
+          const url = bgImages?.get(i)
+          if (url) {
+            // url() layers on inline fragments paint once, as they always have
+            if (rectIndex === 0) bgLayers.push({ url, index: i, box: clipBoxFor(kind) })
+            continue
+          }
           const layer = (layerList[i] ?? '').trim()
           const g = parseCSSGradient(layer)
           if (g) {
@@ -353,21 +390,22 @@ export function emitBox(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx): vo
       }
       const { fillBox, fillInset, bgLayers } = blockClone ? computeGeom(bh) : defaultGeom!
 
-      const splitShadow = shadows.length > 0 && (bgClipText || fillInset)
-      if (splitShadow) {
-        ctx.commands.push({
-          type: 'rect', page, x, y: by, w, h: bh,
-          fill: null, shadow: shadows, radius,
-          opacity, blend,
-        } as RectCommand)
-      }
+      // shadows ignore the background's alpha and wrap its layers, so they split off when the fill
+      // can't carry them: outer ones under the background, inset ones over every layer
+      const splitShadow = shadows.length > 0 && (bgClipText || fillInset || bgAlpha < 1 || bgLayers.length > 0)
+      const shadowRect = (list: typeof shadows) => list.length && ctx.commands.push({
+        type: 'rect', page, x, y: by, w, h: bh,
+        fill: null, shadow: list, radius,
+        opacity, blend,
+      } as RectCommand)
+      if (splitShadow) shadowRect(shadows.filter(sh => !sh.inset))
       if (paintsFill || (shadows.length && !splitShadow)) {
         // rgba()'s own alpha only applies to the plain solid fill — gradient stops
         // and shadow colors already carry their own alpha independently
         ctx.commands.push({
           type: 'rect', page,
           x: x + fillBox.dx, y: by + fillBox.dy, w: fillBox.w, h: fillBox.h,
-          fill:     paintsFill ? (bgColor ?? null) : null,
+          fill:     paintsFill ? bgColor : null,
           shadow:   splitShadow ? undefined : (shadows.length ? shadows : undefined),
           radius:   fillBox.radius,
           opacity: combineOpacity(opacity, bgAlpha),
@@ -387,15 +425,18 @@ export function emitBox(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx): vo
           } as RectCommand)
         } else if (L.conicSrc) {
           const rounded = !!L.box.radius
-          if (rounded) ctx.commands.push({ type: 'clip-push', page, x: lx, y: lyy, w: L.box.w, h: L.box.h, radius: L.box.radius } as ClipCommand)
+          if (rounded) ctx.commands.push({ type: 'clip-push', page, x: lx, y: lyy, w: L.box.w, h: L.box.h, radius: L.box.radius })
           ctx.commands.push({
             type: 'image', page, src: L.conicSrc, format: 'png',
             x: lx, y: lyy, w: L.box.w, h: L.box.h,
             opacity, blend,
           } as ImageCommand)
-          if (rounded) ctx.commands.push({ type: 'clip-pop', page } as ClipCommand)
+          if (rounded) ctx.commands.push({ type: 'clip-pop', page })
+        } else if (L.url) {
+          emitBgImage(el, L.url, ctx, L.index!, splitByTopLevelComma(bgImg).length, page)
         }
       }
+      if (splitShadow) shadowRect(shadows.filter(sh => sh.inset))
 
       // border-image, when its source resolves, paints OVER the normal CSS
       // border entirely (border-style/color still exist for layout only) —
@@ -431,12 +472,49 @@ export function emitBox(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx): vo
           i === 1 ? { x1: x + w - off, y1: by,            x2: x + w - off, y2: by + bh       } :
           i === 2 ? { x1: x,           y1: by + bh - off, x2: x + w,       y2: by + bh - off } :
                     { x1: x + off,     y1: by,            x2: x + off,     y2: by + bh       }
+        // solid and 3D sides fill as bands mitered into their neighbors, as browsers paint
+        // them; a fragment's cut side has no width to miter against
+        const [mT, bR, mB, bL] = bWidths
+        const mR = suppressRight ? 0 : bR, mL = suppressLeft ? 0 : bL
+        const corner = (k: number, f: number): [number, number] =>
+          k === 0 ? [x + f * mL,     by + f * mT]      :
+          k === 1 ? [x + w - f * mR, by + f * mT]      :
+          k === 2 ? [x + w - f * mR, by + bh - f * mB] :
+                    [x + f * mL,     by + bh - f * mB]
+        const quad = (i: number, f0: number, f1: number): PathSeg[] =>
+          [corner(i, f0), corner((i + 1) % 4, f0), corner((i + 1) % 4, f1), corner(i, f1)].map(([px, py], j) => ({ op: j ? 'l' : 'm', args: [px, py] }))
+        // a rounded box fills the ring between the band's two curves, clipped to the side's
+        // mitered quad, so the corners stay round and split where the browser splits them
+        const ring = (f0: number, f1: number): PathSeg[] => {
+          const inset = (f: number) => roundedRectOps(x + f * mL, by + f * mT, w - f * (mL + mR), bh - f * (mT + mB),
+            insetBorderRadius(radius, f * mT, f * mR, f * mB, f * mL))
+          return [...inset(f0), ...(w - f1 * (mL + mR) > 0 && bh - f1 * (mT + mB) > 0 ? inset(f1) : [])]
+        }
+        const band = (i: number, f0: number, f1: number, ca: ColorAlpha) => {
+          const { color: c, alpha: a } = splitColorAlpha(ca)
+          const paint = { fill: c!, opacity: combineOpacity(opacity, a), blend }
+          if (!radius) { ctx.commands.push({ type: 'path', page, ops: quad(i, f0, f1), ...paint } as PathCommand); return }
+          // the miter lines run on past the inner corners, to the box's middle or to where they meet
+          const horizontal = i === 0 || i === 2
+          const depth = horizontal ? (i === 0 ? mT : mB) : (i === 3 ? mL : mR)
+          const across = horizontal ? mL + mR : mT + mB
+          const reach = Math.min((horizontal ? bh : w) / 2 / depth, across > 0 ? (horizontal ? w : bh) / across : Infinity)
+          ctx.commands.push({ type: 'clip-push', page, path: quad(i, 0, Math.max(1, reach)) })
+          ctx.commands.push({ type: 'path', page, ops: ring(f0, f1), evenOdd: true, ...paint } as PathCommand)
+          ctx.commands.push({ type: 'clip-pop', page })
+        }
         for (let i = 0; i < 4; i++) {
           // a fragment's cut side draws no border line at all — the box
           // visually continues past it, there is no true edge there to stroke
           if ((i === 3 && suppressLeft) || (i === 1 && suppressRight)) continue
           const bw = bWidths[i]!, bStyle = bStyles[i]!, bCA = bColorAlphas[i]
           if (bw > 0 && bStyle !== 'none' && bCA) {
+            if (bStyle === 'solid') { band(i, 0, 1, bCA); continue }
+            if (BORDER_3D.has(bStyle)) {
+              const shades = border3dShades(bCA)
+              for (const [f0, f1, dark] of border3dBands(bStyle, i)) band(i, f0, f1, dark ? shades.dark : shades.light)
+              continue
+            }
             const { color: lineColor, alpha: lineAlpha } = splitColorAlpha(bCA)
             const lineOpacity = combineOpacity(opacity, lineAlpha)
             // double = two sub-lines of a third the width at the outer and inner
@@ -491,6 +569,17 @@ function applyTextTransform(text: string, transform: string): string {
   return text
 }
 
+// The nearest ancestor clamping its lines (-webkit-line-clamp), which counts the lines of
+// its block descendants too
+function lineClampBox(el: Element, cache: Map<Element, Element | null>): Element | null {
+  const hit = cache.get(el)
+  if (hit !== undefined) return hit
+  const clamp = (getComputedStyle(el) as any).webkitLineClamp as string | undefined
+  const found = clamp && clamp !== 'none' ? el : el.parentElement ? lineClampBox(el.parentElement, cache) : null
+  cache.set(el, found)
+  return found
+}
+
 // ::first-letter/::first-line apply to the block's opening text — this node
 // carries them only if nothing (element or non-blank text) precedes it
 function isFirstContentOfBlock(textNode: Text): boolean {
@@ -542,7 +631,7 @@ function baselineNeedsWrapper(parentEl: Element): boolean {
 // remain a single flex/grid item and the anchor inherits the run's own line
 // box instead of being centered as an independent, contentless item.
 function measureBaselineY(parentEl: Element, textNode: Text, before: boolean): number {
-  const anchor = document.createElement('span')
+  const anchor = parentEl.ownerDocument.createElement('span')
   anchor.style.cssText = 'display:inline;font-size:0;line-height:0;vertical-align:baseline;'
   if (!baselineNeedsWrapper(parentEl)) {
     parentEl.insertBefore(anchor, before ? textNode : textNode.nextSibling)
@@ -550,7 +639,7 @@ function measureBaselineY(parentEl: Element, textNode: Text, before: boolean): n
     parentEl.removeChild(anchor)
     return y
   }
-  const wrapper = document.createElement('span')
+  const wrapper = parentEl.ownerDocument.createElement('span')
   wrapper.style.cssText = 'display:inline;'
   parentEl.insertBefore(wrapper, textNode)
   if (before) { wrapper.appendChild(anchor); wrapper.appendChild(textNode) }
@@ -559,6 +648,49 @@ function measureBaselineY(parentEl: Element, textNode: Text, before: boolean): n
   parentEl.insertBefore(textNode, wrapper)
   parentEl.removeChild(wrapper)
   return y
+}
+
+// Chrome and WebKit slant an upright face by a fixed 0.25 when the family has no italic
+function syntheticSkew(s: CSSStyleDeclaration, font: FontRef): number | undefined {
+  if (!isSlanted(s.fontStyle) || /italic|oblique/i.test(font.style) || (s as any).fontSynthesisStyle === 'none') return undefined
+  return 0.25
+}
+
+const SMALL_CAPS_SCALE = 0.7
+
+// Chrome's synthesis for a font without small-cap glyphs: lowercase becomes uppercase at 0.7×
+// (small-caps), everything does (all-small-caps), or all but lowercase shrinks (unicase)
+function smallCapsPieces(text: string, s: CSSStyleDeclaration): { text: string; small: boolean }[] | null {
+  const mode = s.fontVariantCaps
+  const isLower = (c: string) => c !== c.toUpperCase()
+  let small: (c: string) => boolean, upper = true
+  if (mode === 'small-caps' || mode === 'petite-caps') small = isLower
+  else if (mode === 'all-small-caps' || mode === 'all-petite-caps') small = () => true
+  else if (mode === 'unicase') { small = c => !isLower(c); upper = false }
+  else return null
+  const pieces: { text: string; small: boolean }[] = []
+  for (const c of text) {
+    const sm = small(c), out = sm && upper ? c.toUpperCase() : c
+    const last = pieces[pieces.length - 1]
+    if (last && last.small === sm) last.text += out
+    else pieces.push({ text: out, small: sm })
+  }
+  return pieces
+}
+
+const fontKey = (s: CSSStyleDeclaration): string =>
+  `${s.fontFamily}|${s.fontSize}|${s.fontWeight}|${s.fontStyle}|${s.fontStretch}|${(s as any).fontSizeAdjust ?? ''}`
+
+// A text run's baseline sits a fixed distance below its glyph-box top for a given font, so the
+// probe runs once per font in the capture; glyphTop is the first line's top in viewport px.
+function baselineOffset(parentEl: Element, textNode: Text, s: CSSStyleDeclaration, glyphTop: number, ctx: WalkerCtx): number {
+  const key = fontKey(s)
+  let offset = ctx.baselineOffsets.get(key)
+  if (offset === undefined) {
+    offset = measureBaselineY(parentEl, textNode, true) - glyphTop
+    ctx.baselineOffsets.set(key, offset)
+  }
+  return offset
 }
 
 // A4 (vertical writing modes): a deliberately scoped-down sibling of
@@ -571,30 +703,29 @@ function measureBaselineY(parentEl: Element, textNode: Text, before: boolean): n
 // Multi-page vertical columns are also out of scope (assumed to fit one page).
 export function captureVerticalTextNode(
   textNode: Text,
-  _parentEl: Element,
   s:        CSSStyleDeclaration,
   ctx:      WalkerCtx,
 ): void {
-  const raw = textNode.textContent ?? ''
+  const raw = textNode.textContent
   if (!raw.trim()) return
   if (s.visibility === 'hidden' || s.visibility === 'collapse') return
 
   const fontRef = resolveFontRef(s.fontFamily, s.fontWeight, s.fontStyle, ctx.fontMap, ctx.registeredFonts)
   if (!fontRef) {
     const fam = (s.fontFamily.split(',')[0] ?? '').replace(/["']/g, '').trim()
-    console.warn(`[daepdf] Font "${fam}" is not registered — vertical text skipped. Register via loadFontsFromManifest() or loadAndRegisterFont().`)
+    console.warn(`[daepdf] Font "${fam}" is not registered – vertical text skipped. Declare it with @font-face in the template's <style> (TTF, OTF or TTC).`)
     return
   }
 
   const sizePx = parseFloat(s.fontSize) || 16
   const sizePt = sizePx / PX_PER_PT
-  const colorAlphaVal = parseColorAlpha(s.color)
-  const color: Color = colorAlphaVal ? [colorAlphaVal[0], colorAlphaVal[1], colorAlphaVal[2]] : [0, 0, 0]
-  const opacity = stackOpacity(ctx)
+  const { color: rgb, alpha } = splitColorAlpha(parseColorAlpha(s.color))
+  const color: Color = rgb ?? [0, 0, 0]
+  const opacity = combineOpacity(stackOpacity(ctx), alpha)
   const blend   = stackBlend(ctx)
 
   const chars = [...raw]
-  const range = document.createRange()
+  const range = textNode.ownerDocument.createRange()
   interface CharHit { ch: string; rect: DOMRect }
   const hits: CharHit[] = []
   let charIdx = 0
@@ -606,21 +737,17 @@ export function captureVerticalTextNode(
     if (r.width < 0.01 && r.height < 0.01) continue
     hits.push({ ch, rect: r })
   }
-  range.detach?.()
   if (!hits.length) return
 
-  // group by LEFT (column) instead of TOP (line) — the same tolerance-
-  // clustering captureTextNode uses for horizontal lines, axes swapped:
-  // a vertical column's characters share an x position and advance in y,
-  // the mirror image of a horizontal line's shared y and advancing x
+  // a column is a run of consecutive characters at one x, as a line is at one y
   interface ColumnGroup { chars: CharHit[]; left: number; minTop: number }
   const columns: ColumnGroup[] = []
   for (const hit of hits) {
     const left = hit.rect.left
-    const existing = columns.find(c => Math.abs(c.left - left) < 3)
-    if (existing) {
-      existing.chars.push(hit)
-      existing.minTop = Math.min(existing.minTop, hit.rect.top)
+    const current = columns.at(-1)
+    if (current && Math.abs(current.left - left) < 3) {
+      current.chars.push(hit)
+      current.minTop = Math.min(current.minTop, hit.rect.top)
     } else {
       columns.push({ chars: [hit], left, minTop: hit.rect.top })
     }
@@ -651,7 +778,7 @@ export function captureVerticalTextNode(
       x: colX, y: ly,
       font: fontRef.name, style: fontRef.style, weight: fontRef.weight,
       size: sizePt, color,
-      align: 'left', maxWidth: (colRight - colLeft) / PX_PER_PT,
+      maxWidth: (colRight - colLeft) / PX_PER_PT,
       opacity, blend,
     } as TextCommand)
   }
@@ -663,7 +790,7 @@ export function captureTextNode(
   s:        CSSStyleDeclaration,
   ctx:      WalkerCtx,
 ): void {
-  const raw = textNode.textContent ?? ''
+  const raw = textNode.textContent
   if (!raw.trim()) return
   // visibility is the parent's — hidden text still occupies space but never paints
   if (s.visibility === 'hidden' || s.visibility === 'collapse') return
@@ -671,7 +798,7 @@ export function captureTextNode(
   const fontRef = resolveFontRef(s.fontFamily, s.fontWeight, s.fontStyle, ctx.fontMap, ctx.registeredFonts)
   if (!fontRef) {
     const fam = (s.fontFamily.split(',')[0] ?? '').replace(/["']/g, '').trim()
-    console.warn(`[daepdf] Font "${fam}" is not registered — text skipped. Register via loadFontsFromManifest() or loadAndRegisterFont().`)
+    console.warn(`[daepdf] Font "${fam}" is not registered – text skipped. Declare it with @font-face in the template's <style> (TTF, OTF or TTC).`)
     return
   }
 
@@ -764,7 +891,7 @@ export function captureTextNode(
           decoStyle.cssFloat !== 'none' ||
           d === 'inline-block' || d === 'inline-table' || d === 'inline-flex' || d === 'inline-grid') break
       decoEl = decoEl.parentElement
-      if (!decoEl || decoEl === document.body) break
+      if (!decoEl || decoEl === decoEl.ownerDocument.body) break
       decoStyle = getComputedStyle(decoEl)
     }
   }
@@ -788,7 +915,7 @@ export function captureTextNode(
     if (flM) { flStart = (flM[1] ?? '').length; flEnd = flStart + (flM[2] ?? '').length }
   }
 
-  const range = document.createRange()
+  const range = textNode.ownerDocument.createRange()
 
   // a <wbr>-chunked long word continues across text nodes — its continuation chunk
   // must not be treated as a fresh word start by text-transform: capitalize
@@ -822,12 +949,16 @@ export function captureTextNode(
     // each piece lands on its own line at its own measured position.
     let segStart = m.index
     let prevTop: number | null = null
+    // Chrome reports the character after a soft-hyphen break with the hyphen's rect first,
+    // so a segment keeps only its own line's rects, and a character its last one
     const closeSegment = (endIdx: number) => {
-      if (endIdx <= segStart) return
+      if (endIdx <= segStart || prevTop === null) return
       range.setStart(textNode, segStart)
       range.setEnd(textNode, endIdx)
-      const sr = range.getBoundingClientRect()
-      if (sr.width < 0.1 && sr.height < 0.1) return
+      const onLine = Array.from(range.getClientRects()).filter(fr => Math.abs(fr.top - prevTop!) <= 3 && (fr.width > 0.1 || fr.height > 0.1))
+      if (!onLine.length) return
+      const left = Math.min(...onLine.map(fr => fr.left)), top = Math.min(...onLine.map(fr => fr.top))
+      const sr = new DOMRect(left, top, Math.max(...onLine.map(fr => fr.right)) - left, Math.max(...onLine.map(fr => fr.bottom)) - top)
       const slice = raw.slice(segStart, endIdx)
       // capitalize only applies at a word start — a mid-word segment must not re-capitalize
       const capAtStart = segStart === m!.index && !midWordChunk
@@ -837,8 +968,8 @@ export function captureTextNode(
     for (let ci = 0; ci < m[0].length; ci++) {
       range.setStart(textNode, m.index + ci)
       range.setEnd(textNode, m.index + ci + 1)
-      const cr = range.getBoundingClientRect()
-      if (cr.width < 0.01 && cr.height < 0.01) continue
+      const cr = Array.from(range.getClientRects()).at(-1)
+      if (!cr || (cr.width < 0.01 && cr.height < 0.01)) continue
       if (prevTop !== null && Math.abs(cr.top - prevTop) > 3) {
         closeSegment(m.index + ci)
         segStart = m.index + ci
@@ -847,7 +978,6 @@ export function captureTextNode(
     }
     closeSegment(m.index + m[0].length)
   }
-  range.detach?.()
 
   // A6 (hyphenation glyph): `hyphens: auto`'s browser-inserted hyphen at a line
   // break is a rendering-only decoration, never part of the DOM text — without
@@ -860,34 +990,39 @@ export function captureTextNode(
   // directly to the wordHit's own text means both the joined-line (`lineOut`)
   // and per-word emission paths pick it up for free, since both read straight
   // from `wordHits[i].text` — no separate handling needed for either.
-  if (s.hyphens === 'auto') {
-    for (let i = 0; i < wordHits.length - 1; i++) {
-      const cur = wordHits[i]!, next = wordHits[i + 1]!
-      if (next.start === cur.start + cur.len && Math.abs(next.rect.top - cur.rect.top) > 3) {
-        cur.text += '-'
-      }
-    }
+  for (let i = 0; i < wordHits.length - 1; i++) {
+    const cur = wordHits[i]!, next = wordHits[i + 1]!
+    if (next.start !== cur.start + cur.len || Math.abs(next.rect.top - cur.rect.top) <= 3) continue
+    // a soft hyphen the line broke at is drawn as a hyphen, whatever the hyphens value
+    if (cur.text.endsWith('\u00AD')) cur.text = cur.text.slice(0, -1) + '-'
+    else if (s.hyphens === 'auto') cur.text += '-'
   }
 
   if (!wordHits.length && !flEnd) return
 
+  // Words come in text order, so a line is a run of them at one height (lines in other
+  // columns can share that height)
   interface LineGroup { words: WordHit[]; minX: number; top: number }
   const lines: LineGroup[] = []
   for (const hit of wordHits) {
     const top = hit.rect.top
-    const existing = lines.find(l => Math.abs(l.top - top) < 3)
-    if (existing) {
-      existing.words.push(hit)
-      existing.minX = Math.min(existing.minX, hit.rect.left)
+    const current = lines.at(-1)
+    if (current && Math.abs(current.top - top) < 3) {
+      current.words.push(hit)
+      current.minX = Math.min(current.minX, hit.rect.left)
     } else {
       lines.push({ words: [hit], minX: hit.rect.left, top })
     }
   }
 
-  const firstBaselineY = measureBaselineY(parentEl, textNode, true) - ctx.containerRect.top
+  // first-letter/first-line styling changes the first line's own metrics, so it measures directly
+  const firstLineTop = lines[0]?.top ?? null
+  const firstBaselineY = (flStyle || fllStyle || firstLineTop === null)
+    ? measureBaselineY(parentEl, textNode, true) - ctx.containerRect.top
+    : firstLineTop - ctx.containerRect.top + baselineOffset(parentEl, textNode, s, firstLineTop, ctx)
 
   if (flEnd > 0) {
-    const flRange = document.createRange()
+    const flRange = textNode.ownerDocument.createRange()
     flRange.setStart(textNode, flStart)
     flRange.setEnd(textNode, flEnd)
     const flRect = flRange.getBoundingClientRect()
@@ -910,9 +1045,9 @@ export function captureTextNode(
         font: flFont.name, style: flFont.style, weight: flFont.weight,
         size: flSizePx / PX_PER_PT,
         color: flCA ? [flCA[0], flCA[1], flCA[2]] as Color : color,
-        align: 'left',
         maxWidth: flRect.width / PX_PER_PT + flSizePx / PX_PER_PT,
         opacity: combineOpacity(opacity, flCA ? flCA[3] / 255 : colorAlpha),
+        skew: syntheticSkew(flStyle!, flFont),
         blend,
       } as TextCommand)
     }
@@ -922,12 +1057,12 @@ export function captureTextNode(
   // justify stretches inter-word gaps and pre preserves space runs — a line joined
   // with single spaces loses both, drifting further right the longer the line gets.
   // Each word already has its own measured rect, so emit words individually instead.
-  // word-spacing also forces per-word emission: the PDF Tw operator only applies to
-  // single-byte code 32, which never occurs in Identity-H (2-byte CID) text — the
-  // browser's word rects already carry the widened gaps, Tw would be a silent no-op
+  // word-spacing also forces per-word emission: the browser's word rects already
+  // carry the widened gaps
   const wsMode  = s.whiteSpace
   // a bidi-mixed run (e.g. "Invoice مرحبا 123") also needs per-word emission —
   // see hasBidiMix's own comment for why this is a complete fix, not a partial one
+  const paraDir: 'ltr' | 'rtl' = s.direction === 'rtl' ? 'rtl' : 'ltr'
   const perWord = s.textAlign === 'justify' || wsMode === 'pre' || wsMode === 'pre-wrap' || wsMode === 'break-spaces' ||
     wsPt !== undefined || hasBidiMix(raw)
 
@@ -949,13 +1084,27 @@ export function captureTextNode(
     }
   }
 
-  const firstLineTop = Math.min(...lines.map(l => l.top))
+  // -webkit-line-clamp: the last line the clamping box shows gets the ellipsis when lines of
+  // this node follow it out of view (all lines are laid out; the box clips the rest)
+  let clampLine = -1, clampRightPx = Infinity
+  const clampEl = drawText ? lineClampBox(parentEl, ctx.clampBoxes) : null
+  if (clampEl) {
+    const cr = clampEl.getBoundingClientRect(), ccs = getComputedStyle(clampEl)
+    const bottom = cr.top + clampEl.clientTop + clampEl.clientHeight - (parseFloat(ccs.paddingBottom) || 0)
+    let lastShown = -1
+    for (const [li, l] of lines.entries()) if (Math.max(...l.words.map(w => w.rect.bottom)) <= bottom + 1) lastShown = li
+    if (lastShown >= 0 && lastShown < lines.length - 1) {
+      clampLine = lastShown
+      clampRightPx = cr.left + clampEl.clientLeft + clampEl.clientWidth - (parseFloat(ccs.paddingRight) || 0)
+    }
+  }
+
   // constant offset from a line's top to its own baseline, for this font/size — real
   // fonts' natural line-height varies from any fixed multiplier (the old code assumed
   // sizePx*1.2 for CSS line-height:normal), so extrapolating later lines' Y as
   // lineIndex*lineHeightPx drifted further off with every additional line. Using each
   // line's own measured top plus this constant instead needs no line-height guess at all.
-  const ascentOffset = firstBaselineY - (firstLineTop - ctx.containerRect.top)
+  const ascentOffset = firstBaselineY - (firstLineTop! - ctx.containerRect.top)
 
   const baseStyle: LineStyle = { fontRef, sizePt, color, textOpacity, lsPt }
   let fllResolved: LineStyle | null = null
@@ -976,7 +1125,7 @@ export function captureTextNode(
     }
     if (lines.length > 1) {
       const lastBaselineY = measureBaselineY(parentEl, textNode, false) - ctx.containerRect.top
-      const lastLineTop = Math.max(...lines.map(l => l.top))
+      const lastLineTop = lines.at(-1)!.top
       ascentOffsetRest = lastBaselineY - (lastLineTop - ctx.containerRect.top)
     }
   }
@@ -1000,52 +1149,64 @@ export function captureTextNode(
 
     const { page, y: ly } = paginate(yPt, ctx.pageH)
 
-    // truncate at the ellipsis limit: whole words while they fit, then the boundary
-    // word character by character, then append the ellipsis the browser shows
+    // how far a run advances: its glyphs at their (small-caps) sizes plus letter and word spacing
+    const pieceWidth = (txt: string, font: FontRef, size: number) =>
+      measure_string_width(txt, font.name, font.style, font.weight, 0, size) + (st.lsPt ?? 0) * [...txt].length +
+      (wsPt ?? 0) * (txt.match(/[ \u00A0]/g)?.length ?? 0)
+    const runWidth = (txt: string, font: FontRef) => (smallCapsPieces(txt, famSrc) ?? [{ text: txt, small: false }])
+      .reduce((sum, pc) => sum + pieceWidth(pc.text, font, pc.small ? st.sizePt * SMALL_CAPS_SCALE : st.sizePt), 0)
+
+    // truncated to the longest prefix that fits with the ellipsis, measured with the font:
+    // WebKit collapses the hidden part of an ellipsized line, so its rects all seem to fit
     let lineOut   = lineText
     let truncated = false
-    if (ellipsisLimitPx !== Infinity) {
-      const ellW  = measure_string_width('…', fontRef.name, fontRef.style, fontRef.weight, 0, sizePt) * PX_PER_PT
-      const limit = ellipsisLimitPx - ellW
-      const kept: string[] = []
-      for (const wd of line.words) {
-        if (wd.rect.right <= limit) { kept.push(wd.text); continue }
+    const limitPx = li === clampLine ? clampRightPx : ellipsisLimitPx
+    if (limitPx !== Infinity) {
+      const width = (t: string) => runWidth(t, st.fontRef) * PX_PER_PT
+      const avail = limitPx - line.minX - width('…')
+      const chars = [...lineText]
+      if (li === clampLine || width(lineText) > limitPx - line.minX) {
         truncated = true
-        if (wd.rect.left < limit) {
-          let sub = ''
-          for (let ci = 1; ci <= wd.len; ci++) {
-            const r2 = document.createRange()
-            r2.setStart(textNode, wd.start)
-            r2.setEnd(textNode, wd.start + ci)
-            if (r2.getBoundingClientRect().right > limit) break
-            sub = raw.slice(wd.start, wd.start + ci)
-          }
-          if (sub) kept.push(applyTextTransform(sub, txform))
+        let lo = 0, hi = chars.length
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1
+          if (width(chars.slice(0, mid).join('')) <= avail) lo = mid
+          else hi = mid - 1
         }
-        break
-      }
-      if (truncated) {
-        // if even the first word starts past the limit, an earlier sibling node
+        // if even the first character is past the limit, an earlier sibling node
         // already carries the ellipsis — emit nothing here
-        const anyVisible = kept.length > 0 || (line.words[0]?.rect.left ?? 0) < limit
-        lineOut = anyVisible ? kept.join(' ') + '…' : ''
+        lineOut = avail > 0 ? chars.slice(0, lo).join('').trimEnd() + '…' : ''
       }
       if (!lineOut) continue
     }
 
-    const emitRun = (txt: string, tx: number, maxW: number, font: FontRef, ws?: number) => {
+    // dir: the run's own direction, when it differs from the paragraph's (digits in RTL text)
+    const emitRun = (txt: string, tx: number, maxW: number, font: FontRef, ws?: number, dir = paraDir) => {
+      const pieces = smallCapsPieces(txt, famSrc)
+      if (!pieces) { emitPiece(txt, tx, maxW, font, st.sizePt, ws, dir); return }
+      let px = tx
+      for (const pc of pieces) {
+        const size = pc.small ? st.sizePt * SMALL_CAPS_SCALE : st.sizePt
+        const w = pieceWidth(pc.text, font, size)
+        emitPiece(pc.text, px, w, font, size, ws, dir)
+        px += w
+      }
+    }
+
+    const emitPiece = (txt: string, tx: number, maxW: number, font: FontRef, sizePt: number, ws: number | undefined, dir: 'ltr' | 'rtl') => {
+      const skew = syntheticSkew(famSrc, font)
       for (let si = tShadows.length - 1; si >= 0; si--) {
         const sh = tShadows[si]!
         ctx.commands.push({
           type: 'text', page, text: txt,
           x: tx + sh.x, y: ly + sh.y,
           font: font.name, style: font.style, weight: font.weight,
-          size: st.sizePt, color: [sh.color[0], sh.color[1], sh.color[2]] as Color,
-          align: 'left', maxWidth: maxW,
-          direction: s.direction === 'rtl' ? 'rtl' : 'ltr',
-          letterSpacing: st.lsPt, wordSpacing: ws,
+          size: sizePt, color: [sh.color[0], sh.color[1], sh.color[2]] as Color,
+          maxWidth: maxW,
+          direction: dir,
+          letterSpacing: st.lsPt, wordSpacing: ws, skew,
           // blur is approximated by knocking the shadow's alpha down
-          opacity: combineOpacity(opacity, (sh.color[3] ?? 255) / 255 * (sh.blur ? 0.55 : 1)),
+          opacity: combineOpacity(opacity, sh.color[3] / 255 * (sh.blur ? 0.55 : 1)),
           blend,
         } as TextCommand)
       }
@@ -1053,10 +1214,10 @@ export function captureTextNode(
         type: 'text', page, text: txt,
         x: tx, y: ly,
         font: font.name, style: font.style, weight: font.weight,
-        size: st.sizePt, color: st.color,
-        align: 'left', maxWidth: maxW,
-        direction: s.direction === 'rtl' ? 'rtl' : 'ltr',
-        letterSpacing: st.lsPt, wordSpacing: ws,
+        size: sizePt, color: st.color,
+        maxWidth: maxW,
+        direction: dir,
+        letterSpacing: st.lsPt, wordSpacing: ws, skew,
         opacity: st.textOpacity,
         stroke: textStroke?.color,
         strokeWidth: textStroke?.width,
@@ -1065,27 +1226,51 @@ export function captureTextNode(
       } as TextCommand)
     }
 
+    const fontRuns = (txt: string) =>
+      splitByFontCoverage(txt, st.fontRef, famSrc.fontFamily, famSrc.fontWeight, famSrc.fontStyle, ctx.fontMap, ctx.registeredFonts)
+
     // per-character font fallback (a codepoint st.fontRef doesn't cover falls
     // back to a font that does) splits txt into per-font runs, each emitted at
-    // its own cumulative x — skipped for RTL, where maxWidth instead anchors
-    // the whole run's right edge (pdf/index.ts) and a sub-run's own width
-    // would need its own bidi-aware repositioning, out of this batch's scope
+    // its own cumulative x; RTL text needing it goes word by word (emitRtlWord)
     const emitTextCmd = (txt: string, tx: number, maxW: number, ws?: number) => {
       if (s.direction === 'rtl') { emitRun(txt, tx, maxW, st.fontRef, ws); return }
-      const runs = splitByFontCoverage(txt, st.fontRef, famSrc.fontFamily, famSrc.fontWeight, famSrc.fontStyle, ctx.fontMap, ctx.registeredFonts)
+      const runs = fontRuns(txt)
       if (runs.length === 1) { emitRun(txt, tx, maxW, st.fontRef, ws); return }
       let runX = tx
       for (const run of runs) {
-        const runWidthPt = measure_string_width(run.text, run.font.name, run.font.style, run.font.weight, 0, st.sizePt)
+        const runWidthPt = runWidth(run.text, run.font)
         emitRun(run.text, runX, runWidthPt, run.font, ws)
         runX += runWidthPt
       }
     }
 
+    // RTL text mixing fonts or directions (digits run left to right) goes run by run, each shaped
+    // alone where the browser put it: shaping the whole line right to left would reverse digits
+    const emitRtlWord = (wd: WordHit) => {
+      const runs = fontRuns(wd.text).flatMap(run => directionRuns(run.text, paraDir).map(r => ({ ...r, font: run.font })))
+      const x = (wd.rect.left - ctx.containerRect.left) / PX_PER_PT, w = wd.rect.width / PX_PER_PT
+      if (runs.length === 1) { emitRun(wd.text, x, w, runs[0]!.font, undefined, runs[0]!.dir); return }
+      // a transformed or hyphenated word no longer lines up with its source offsets
+      if (wd.text.length !== wd.len) { emitRun(wd.text, x, w, st.fontRef); return }
+      const runRange = textNode.ownerDocument.createRange()
+      let off = wd.start
+      for (const run of runs) {
+        runRange.setStart(textNode, off)
+        runRange.setEnd(textNode, off + run.text.length)
+        const r = Array.from(runRange.getClientRects()).find(fr => Math.abs(fr.top - wd.rect.top) < 3) ?? runRange.getBoundingClientRect()
+        emitRun(run.text, (r.left - ctx.containerRect.left) / PX_PER_PT, r.width / PX_PER_PT, run.font, undefined, run.dir)
+        off += run.text.length
+      }
+    }
+    const lineDirs = new Set([...lineOut].map(charDirection))
+    const rtlByWord = drawText && !truncated && s.direction === 'rtl' &&
+      (fontRuns(lineOut).length > 1 || (lineDirs.has('ltr') && lineDirs.has('rtl')))
+
     // browser positions each word via DOM rects — emit left-aligned at the captured x
-    if (drawText && perWord && !truncated) {
+    if (drawText && (perWord || rtlByWord) && !truncated) {
       for (const wd of line.words) {
-        emitTextCmd(wd.text, (wd.rect.left - ctx.containerRect.left) / PX_PER_PT, wd.rect.width / PX_PER_PT)
+        if (s.direction === 'rtl') emitRtlWord(wd)
+        else emitTextCmd(wd.text, (wd.rect.left - ctx.containerRect.left) / PX_PER_PT, wd.rect.width / PX_PER_PT)
       }
     } else if (drawText) {
       emitTextCmd(lineOut, xPt, wPt || st.sizePt * lineOut.length * 0.6, wsPt)
@@ -1111,19 +1296,17 @@ export function captureTextNode(
 }
 
 function markerLabel(type: string, index: number): string | null {
+  // list-style-type: "→ " computes to the quoted string, shown as is
+  const str = type.match(/^"((?:[^"\\]|\\.)*)"$/)
+  if (str) return (str[1] ?? '').replace(/\\(.)/g, '$1')
   switch (type) {
-    case 'disc':                 return '•'
-    case 'circle':               return '◦'
-    case 'square':               return '▪'
-    case 'decimal':              return `${index}.`
     case 'decimal-leading-zero': return `${index < 10 && index >= 0 ? '0' : ''}${index}.`
-    case 'lower-alpha':
-    case 'lower-latin':          return `${alphaLabel(index)}.`
-    case 'upper-alpha':
-    case 'upper-latin':          return `${alphaLabel(index).toUpperCase()}.`
-    case 'lower-roman':          return `${romanNumeral(index).toLowerCase()}.`
-    case 'upper-roman':          return `${romanNumeral(index)}.`
-    default:                     return '•'
+    // ordinal styles reuse counter() text, with its decimal fallback past their range
+    case 'lower-alpha': case 'lower-latin': case 'upper-alpha': case 'upper-latin':
+    case 'lower-greek': case 'upper-greek': case 'lower-roman': case 'upper-roman':
+      return `${counterText(index, type)}.`
+    // CSS treats a counter style it can't resolve as decimal
+    default:                  return `${index}.`
   }
 }
 
@@ -1134,32 +1317,77 @@ function markerLabel(type: string, index: number): string | null {
 // version computed purely from `start + position`, silently ignoring any
 // `<li value>` on an earlier sibling — e.g. `<li value="10">`, `<li>` numbered
 // the second item "2" (position-based) instead of "11" (value-based).
-function listIndex(el: Element): number {
+// Items are numbered in document order, so the walk back stops at the previous item's
+// cached ordinal instead of rescanning every sibling (quadratic on long lists).
+const ordinals = new WeakMap<Element, number>()
+
+export function listIndex(el: Element): number {
+  const index = computeListIndex(el)
+  ordinals.set(el, index)
+  return index
+}
+
+function computeListIndex(el: Element): number {
   const li = el as HTMLLIElement
   if (li.value > 0) return li.value
 
+  const parent = el.parentElement
+  const ol = parent?.tagName === 'OL' ? parent as HTMLOListElement : null
+  // a reversed list counts down, from the number of items unless start says otherwise
+  const step = ol?.reversed ? -1 : 1
   let gap = 0
   let sib: Element | null = el.previousElementSibling
   while (sib) {
     if (getComputedStyle(sib).display === 'list-item') {
       gap++
-      const sibLi = sib as HTMLLIElement
-      if (sibLi.value > 0) return sibLi.value + gap
+      const known = ordinals.get(sib) ?? ((sib as HTMLLIElement).value > 0 ? (sib as HTMLLIElement).value : undefined)
+      if (known !== undefined) return known + step * gap
     }
     sib = sib.previousElementSibling
   }
-  const parent = el.parentElement
-  const start = parent instanceof HTMLOListElement ? parent.start : 1
-  return start + gap
+  const items = () => Array.from(ol!.children).filter(c => getComputedStyle(c).display === 'list-item').length
+  const start = !ol ? 1 : ol.hasAttribute('start') ? ol.start : ol.reversed ? items() : 1
+  return start + step * gap
 }
 
-// ul/ol bullets and numbers are ::marker boxes, not text nodes — without synthesizing
-// them here, every list exports as indented text with no markers at all. The marker is
-// right-aligned to end a small gap before the first line's content, which holds for
-// both list-style-position values (for 'inside' the content starts after the marker,
-// so the probe still lands to its right).
+// Chrome draws these markers as shapes, so a font without the glyphs doesn't matter. Measured
+// across fonts and sizes: a 0.3em disc or square (0.35em circle, 1px ring), bottom 0.15em over
+// the baseline, 0.32em + 7px before the content; triangles 0.65 x 0.56em, about 8px before it.
+const SHAPE_MARKERS = new Set(['disc', 'circle', 'square', 'disclosure-open', 'disclosure-closed'])
+
+function markerShape(type: string, left: number, baseline: number, em: number): { ops: PathSeg[]; ring?: number } {
+  const K = 0.5523
+  const ellipse = (cx: number, cy: number, r: number): PathSeg[] => [
+    { op: 'm', args: [cx + r, cy] },
+    { op: 'c', args: [cx + r, cy + r * K, cx + r * K, cy + r, cx, cy + r] },
+    { op: 'c', args: [cx - r * K, cy + r, cx - r, cy + r * K, cx - r, cy] },
+    { op: 'c', args: [cx - r, cy - r * K, cx - r * K, cy - r, cx, cy - r] },
+    { op: 'c', args: [cx + r * K, cy - r, cx + r, cy - r * K, cx + r, cy] },
+  ]
+  const poly = (pts: number[][]): PathSeg[] => pts.map(([x, y], i) => ({ op: i ? 'l' : 'm', args: [x!, y!] }))
+  if (type === 'disclosure-open') {
+    const w = 0.65 * em, h = 0.5625 * em, r = left - 8, b = baseline - 0.05 * em
+    return { ops: poly([[r - w, b - h], [r, b - h], [r - w / 2, b]]) }
+  }
+  if (type === 'disclosure-closed') {
+    const w = 0.5625 * em, h = 0.65 * em, r = left - 8 - 0.08 * em
+    return { ops: poly([[r - w, baseline - h], [r, baseline - h / 2], [r - w, baseline]]) }
+  }
+  const d = Math.max(1, Math.round((type === 'circle' ? 0.35 : 0.3) * em))
+  const right = left - (0.32 * em + 7), bottom = baseline - 0.15 * em
+  if (type === 'square') return { ops: poly([[right - d, bottom - d], [right, bottom - d], [right, bottom], [right - d, bottom]]) }
+  // a ring is stroked on its centerline, half the 1px inside the outer edge
+  return type === 'circle'
+    ? { ops: ellipse(right - d / 2, bottom - d / 2, (d - 1) / 2), ring: 1 }
+    : { ops: ellipse(right - d / 2, bottom - d / 2, d / 2) }
+}
+
+// ::marker boxes aren't nodes, so markers are drawn here, a small gap before the first line's
+// content (after the marker too when it sits inside); RTL mirrors that from the content's right edge
 export function emitListMarker(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx): void {
   if (s.display !== 'list-item') return
+  const rtl = s.direction === 'rtl'
+  const rightEdge = () => el.getBoundingClientRect().right - (parseFloat(s.borderRightWidth) || 0) - (parseFloat(s.paddingRight) || 0)
   const type = s.listStyleType
   if (!type || type === 'none') return
 
@@ -1167,55 +1395,123 @@ export function emitListMarker(el: Element, s: CSSStyleDeclaration, ctx: WalkerC
   // an authored ::marker { content: none } suppresses the marker (default is 'normal')
   if (ms.content === 'none') return
   let text: string | null = null
-  const strM = (ms.content ?? '').match(/^"((?:[^"\\]|\\.)*)"$/)
+  const strM = ms.content.match(/^"((?:[^"\\]|\\.)*)"$/)
   if (strM?.[1] !== undefined) text = strM[1].replace(/\\(.)/g, '$1')
-  if (text === null) text = markerLabel(type, listIndex(el))
+
+  if (text === null && SHAPE_MARKERS.has(type)) {
+    const start = contentStart(el, s, ctx)
+    if (!start) return
+    const { color: clr, alpha } = splitColorAlpha(parseColorAlpha(ms.color || s.color))
+    const edge = (rtl ? rightEdge() : start.left) - ctx.containerRect.left
+    const shape = markerShape(type, rtl ? -edge : edge, start.baseline - ctx.containerRect.top, parseFloat(s.fontSize) || 16)
+    const mirror = (seg: PathSeg) => rtl ? { op: seg.op, args: seg.args.map((v, i) => i % 2 ? v : -v) } : seg
+    const ops = shape.ops.map(mirror).map(seg => ({ op: seg.op, args: seg.args.map(v => v / PX_PER_PT) }))
+    const ys = ops.flatMap(seg => seg.args.filter((_, i) => i % 2 === 1))
+    const { page, y: ly } = paginate(Math.min(...ys), ctx.pageH)
+    const dy = ly - Math.min(...ys)
+    ctx.commands.push({
+      type: 'path', page, ops: ops.map(seg => ({ op: seg.op, args: seg.args.map((v, i) => i % 2 ? v + dy : v) })),
+      ...(shape.ring ? { stroke: clr ?? [0, 0, 0], strokeWidth: shape.ring / PX_PER_PT } : { fill: clr ?? [0, 0, 0] }),
+      opacity: combineOpacity(stackOpacity(ctx), alpha), blend: stackBlend(ctx),
+    } as PathCommand)
+    return
+  }
+
+  if (text === null) {
+    text = markerLabel(type, listIndex(el))
+    // the suffix is a neutral character, so in RTL it shows on the left: ".1"
+    if (text && rtl && text.endsWith('.')) text = '.' + text.slice(0, -1)
+  }
   if (!text) return
 
   const fontRef = resolveFontRef(s.fontFamily, s.fontWeight, s.fontStyle, ctx.fontMap, ctx.registeredFonts)
   if (!fontRef) return
 
-  const probe = document.createElement('span')
+  const start = contentStart(el, s, ctx)
+  if (!start) return
+  const sizePx = parseFloat(s.fontSize) || 16
+  const sizePt = sizePx / PX_PER_PT
+  const markerW = measure_string_width(text, fontRef.name, fontRef.style, fontRef.weight, 0, sizePt)
+  const gapPt   = sizePt * 0.4
+
+  const xPt = rtl
+    ? (rightEdge() - ctx.containerRect.left) / PX_PER_PT + gapPt
+    : (start.left - ctx.containerRect.left) / PX_PER_PT - gapPt - markerW
+  const yPt = (start.baseline - ctx.containerRect.top)  / PX_PER_PT
+  const { page, y: ly } = paginate(yPt, ctx.pageH)
+  const { color: clr, alpha } = splitColorAlpha(parseColorAlpha(ms.color || s.color))
+
+  ctx.commands.push({
+    type: 'text', page,
+    text,
+    x: xPt, y: ly,
+    font: fontRef.name, style: fontRef.style, weight: fontRef.weight,
+    size: sizePt, color: clr ?? ([0, 0, 0] as Color),
+    maxWidth: markerW + sizePt,
+    opacity: combineOpacity(stackOpacity(ctx), alpha),
+    skew: syntheticSkew(s, fontRef),
+    blend: stackBlend(ctx),
+  } as TextCommand)
+}
+
+// Where a list item's first line starts and its baseline (viewport px): from the first
+// character and the per-font offset when it opens with text, else a probe (a relayout).
+function contentStart(el: Element, s: CSSStyleDeclaration, ctx: WalkerCtx): { left: number; baseline: number } | null {
+  let first = el.firstChild
+  while (first?.nodeType === Node.TEXT_NODE && !(first.textContent ?? '').trim()) first = first.nextSibling
+  if (first?.nodeType === Node.TEXT_NODE) {
+    const text = first as Text
+    const raw = text.textContent
+    const i = raw.search(/\S/)
+    const range = el.ownerDocument.createRange()
+    range.setStart(text, i)
+    range.setEnd(text, i + ((raw.codePointAt(i) ?? 0) > 0xFFFF ? 2 : 1))
+    const r = range.getBoundingClientRect()
+    if (r.width > 0 || r.height > 0) return { left: r.left, baseline: r.top + baselineOffset(el, text, s, r.top, ctx) }
+  }
+  const probe = el.ownerDocument.createElement('span')
   probe.style.cssText = 'display:inline;font-size:0;line-height:0;vertical-align:baseline;visibility:hidden;pointer-events:none;'
   try {
     el.insertBefore(probe, el.firstChild)
     const pr = probe.getBoundingClientRect()
-    el.removeChild(probe)
-
-    const sizePx = parseFloat(s.fontSize) || 16
-    const sizePt = sizePx / PX_PER_PT
-    const markerW = measure_string_width(text, fontRef.name, fontRef.style, fontRef.weight, 0, sizePt)
-    const gapPt   = sizePt * 0.4
-
-    const xPt = (pr.left - ctx.containerRect.left) / PX_PER_PT - gapPt - markerW
-    const yPt = (pr.top  - ctx.containerRect.top)  / PX_PER_PT
-    const { page, y: ly } = paginate(yPt, ctx.pageH)
-    const { color: clr, alpha } = splitColorAlpha(parseColorAlpha(ms.color || s.color))
-
-    ctx.commands.push({
-      type: 'text', page,
-      text,
-      x: xPt, y: ly,
-      font: fontRef.name, style: fontRef.style, weight: fontRef.weight,
-      size: sizePt, color: clr ?? ([0, 0, 0] as Color),
-      align: 'left',
-      maxWidth: markerW + sizePt,
-      opacity: combineOpacity(stackOpacity(ctx), alpha),
-    } as TextCommand)
+    return { left: pr.left, baseline: pr.top }
   } catch {
-    try { el.removeChild(probe) } catch { /* already removed or never inserted */ }
+    return null
+  } finally {
+    probe.remove()
   }
 }
 
-function isSafeHref(href: string): boolean {
-  if (href.startsWith('#')) return true
-  const lower = href.toLowerCase().trimStart()
-  return lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('mailto:')
+const collapse = (s: string | null | undefined): string => (s ?? '').replace(/\s+/g, ' ').trim()
+
+// The text of an element without the form controls inside it (a select's options would
+// otherwise read as part of its label)
+function labelText(el: Element): string {
+  const copy = el.cloneNode(true) as Element
+  for (const control of Array.from(copy.querySelectorAll('input, select, textarea, button'))) control.remove()
+  return collapse(copy.textContent)
+}
+
+// A form control's accessible name, in the order browsers compute it
+function controlName(el: Element, fallback: string): string {
+  const doc = el.ownerDocument
+  const byIds = (el.getAttribute('aria-labelledby') ?? '').split(/\s+/).filter(Boolean)
+    .map(id => doc.getElementById(id)).filter((e): e is HTMLElement => !!e).map(labelText).join(' ')
+  const label = (el as HTMLInputElement).labels?.[0]
+  return byIds || collapse(el.getAttribute('aria-label')) || (label ? labelText(label) : '') ||
+    collapse(el.getAttribute('title')) || collapse(el.getAttribute('placeholder')) || fallback
 }
 
 export function emitLinks(el: HTMLAnchorElement, ctx: WalkerCtx): void {
-  const href = el.getAttribute('href')
-  if (!href || !isSafeHref(href)) return
+  const raw = el.getAttribute('href')
+  if (!raw) return
+  // a fragment stays an internal jump; anything else resolves against the page's address,
+  // so a relative link still leads somewhere from the PDF
+  const href = raw.startsWith('#') ? raw : el.href
+  if (!href.startsWith('#') && !LINK_SCHEMES.test(href)) return
+  // the link's accessible description: its label, its text or an image's alt, else its target
+  const contents = collapse(el.getAttribute('aria-label')) || collapse(el.getAttribute('title')) || collapse(el.textContent) ||
+    collapse(el.querySelector('img[alt]')?.getAttribute('alt')) || href
   for (const domRect of Array.from(el.getClientRects())) {
     if (domRect.width < 1 || domRect.height < 1) continue
     const { x, y, w, h } = domRectToPt(domRect, ctx.containerRect)
@@ -1225,7 +1521,7 @@ export function emitLinks(el: HTMLAnchorElement, ctx: WalkerCtx): void {
       const sliceTop = Math.max(0, ly)
       const sliceH   = Math.min(ctx.pageH, ly + h) - sliceTop
       if (sliceH < 0.5) continue
-      ctx.commands.push({ type: 'link', page, href, x, y: sliceTop, w, h: sliceH } as LinkCommand)
+      ctx.commands.push({ type: 'link', page, href, x, y: sliceTop, w, h: sliceH, structAnnot: tagStructAnnot(ctx, page), contents } as LinkCommand)
     }
   }
 }
@@ -1235,6 +1531,9 @@ export function emitLinks(el: HTMLAnchorElement, ctx: WalkerCtx): void {
 // aren't data fields at all — scoped to the controls that map cleanly onto
 // /FT /Tx, /Btn, /Ch.
 const TEXT_LIKE_INPUT_TYPES = new Set(['text', 'email', 'tel', 'url', 'number', 'password', 'search', ''])
+
+// PDF field flags (/Ff), ISO 32000-1 tables 221, 228 and 232
+const FF_READONLY = 1 << 0, FF_MULTILINE = 1 << 12, FF_PASSWORD = 1 << 13, FF_COMBO = 1 << 17, FF_MULTISELECT = 1 << 21
 
 // A form control spanning a page break would need /Kids (multiple widgets
 // sharing one field) — real, but a genuine edge case for a typically-small
@@ -1249,9 +1548,16 @@ export function emitFormField(el: Element, s: CSSStyleDeclaration, ctx: WalkerCt
   const color = parseColorAlpha(s.color)
   const rgb: Color = color ? [color[0], color[1], color[2]] : [0, 0, 0]
 
-  // field names must be unique per document — the DOM's own `name` attribute
-  // is the natural source; an absent one still needs a stable, distinct name
+  // the DOM's own `name` is the natural source; PdfDoc makes repeats unique
   const name = (el as HTMLInputElement).name || `field${ctx.fieldCounter.n++}`
+  const tooltip = controlName(el, name)
+  // tagged only once a field is certain, so no structure element points at a missing widget
+  const pushField = (cmd: FieldCommand): void => {
+    const structAnnot = tagStructAnnot(ctx, page)
+    ctx.commands.push(structAnnot === undefined ? { ...cmd, tooltip } : { ...cmd, structAnnot, tooltip })
+  }
+  // a control the page doesn't let you edit stays uneditable in the PDF
+  const readOnly = (el as HTMLInputElement).disabled || (el as HTMLInputElement).readOnly ? FF_READONLY : 0
 
   // Btn (checkbox/radio) draws a pure-vector checkmark — no font involved at
   // all — so this must be dispatched BEFORE the font-resolution gate below.
@@ -1263,10 +1569,10 @@ export function emitFormField(el: Element, s: CSSStyleDeclaration, ctx: WalkerCt
   if (tag === 'INPUT') {
     const inputType = ((el as HTMLInputElement).type || 'text').toLowerCase()
     if (inputType === 'checkbox' || inputType === 'radio') {
-      ctx.commands.push({
+      pushField({
         type: 'field', page, x, y: ly, w, h, name,
         font: '', style: '', weight: 400, size: 0, color: rgb,
-        fieldType: 'Btn', checked: (el as HTMLInputElement).checked,
+        fieldType: 'Btn', checked: (el as HTMLInputElement).checked, flags: readOnly || undefined,
       } as FieldCommand)
       return
     }
@@ -1290,22 +1596,31 @@ export function emitFormField(el: Element, s: CSSStyleDeclaration, ctx: WalkerCt
 
   if (tag === 'SELECT') {
     const select = el as HTMLSelectElement
-    const options = Array.from(select.options).map(o => o.value || o.text)
-    const sel = select.options[select.selectedIndex]
-    ctx.commands.push({ ...base, fieldType: 'Ch', value: sel?.value || sel?.text || '', options } as FieldCommand)
+    const opts = Array.from(select.options)
+    const sel = opts[select.selectedIndex]
+    // a dropdown is a combo box; without the flag viewers draw a list box
+    const flags = (select.multiple ? FF_MULTISELECT : select.size > 1 ? 0 : FF_COMBO) | readOnly
+    const exportValues = opts.some(o => o.value !== o.text) ? opts.map(o => o.value) : undefined
+    pushField({
+      ...base, fieldType: 'Ch', flags, value: sel?.value ?? '', display: sel?.text ?? '',
+      options: opts.map(o => o.text), exportValues,
+    } as FieldCommand)
     return
   }
 
   if (tag === 'TEXTAREA') {
-    ctx.commands.push({ ...base, fieldType: 'Tx', value: (el as HTMLTextAreaElement).value } as FieldCommand)
+    pushField({ ...base, fieldType: 'Tx', flags: FF_MULTILINE | readOnly, value: (el as HTMLTextAreaElement).value })
     return
   }
 
   if (tag === 'INPUT') {
     const input = el as HTMLInputElement
     const inputType = (input.type || 'text').toLowerCase()
-    if (TEXT_LIKE_INPUT_TYPES.has(inputType)) {
-      ctx.commands.push({ ...base, fieldType: 'Tx', value: input.value } as FieldCommand)
+    if (inputType === 'password') {
+      // the page shows bullets, so the PDF does too; the value itself is never written
+      pushField({ ...base, fieldType: 'Tx', flags: FF_PASSWORD | readOnly, value: '', display: '•'.repeat([...input.value].length) })
+    } else if (TEXT_LIKE_INPUT_TYPES.has(inputType)) {
+      pushField({ ...base, fieldType: 'Tx', flags: readOnly || undefined, value: input.value } as FieldCommand)
     }
   }
 }
@@ -1318,274 +1633,4 @@ export function captureAnchor(el: Element, ctx: WalkerCtx): void {
   const yPt = (r.top - ctx.containerRect.top) / PX_PER_PT
   const { page, y } = paginate(yPt, ctx.pageH)
   ctx.anchors.set(el.id, { page, y })
-}
-
-// Decorative pseudo boxes (accent bars, dividers, dots): content:'' plus a background
-// and explicit dimensions. There is no DOM node to measure, so the box is placed from
-// the geometry the browser DOES expose — computed size/margins/offsets plus the
-// element's own rect — and only for layouts where that placement is exact; anything
-// ambiguous (auto offsets, transforms beyond pure translate, flex/grid parents) is
-// skipped rather than painted in the wrong place.
-interface PseudoBoxSpec {
-  anchor:    'flow' | 'abs' | 'probe'
-  w:         number
-  h:         number
-  dx:        number
-  dy:        number
-  mL:        number | null
-  mR:        number | null
-  mT:        number
-  mB:        number
-  fill:      Color | null
-  fillAlpha: number
-  gradient?: Gradient | undefined
-  border:    { w: number; color: Color; alpha: number } | null
-  radius?:   BorderRadius | undefined
-}
-
-function pseudoBoxSpec(el: Element, ps: CSSStyleDeclaration): PseudoBoxSpec | null {
-  const wPx = parseFloat(ps.width)
-  const hPx = parseFloat(ps.height)
-  if (!(wPx > 0) || !(hPx > 0)) return null
-  const w = wPx / PX_PER_PT
-  const h = hPx / PX_PER_PT
-
-  const bgCA = parseColorAlpha(ps.backgroundColor)
-  let gradient: Gradient | undefined
-  if (ps.backgroundImage && ps.backgroundImage !== 'none') {
-    for (const layer of splitByTopLevelComma(ps.backgroundImage)) {
-      gradient = parseCSSGradient(layer.trim()) ?? undefined
-      if (gradient) break
-    }
-  }
-  let border: PseudoBoxSpec['border'] = null
-  const bw = pxToPt(ps.borderTopWidth || '0px')
-  if (bw > 0 && ps.borderTopStyle !== 'none' &&
-      ps.borderRightWidth === ps.borderTopWidth &&
-      ps.borderBottomWidth === ps.borderTopWidth &&
-      ps.borderLeftWidth === ps.borderTopWidth) {
-    const bCA = parseColorAlpha(ps.borderTopColor)
-    if (bCA) border = { w: bw, color: [bCA[0], bCA[1], bCA[2]], alpha: bCA[3] / 255 }
-  }
-  if (!bgCA && !gradient && !border) return null
-
-  // the ubiquitous translate() centering resolves to a pure-translation matrix with
-  // px offsets already computed — anything else can't be placed truthfully
-  let dx = 0, dy = 0
-  if (ps.transform && ps.transform !== 'none') {
-    const m = ps.transform.match(/^matrix\(1,\s*0,\s*0,\s*1,\s*(-?[\d.]+),\s*(-?[\d.]+)\)$/)
-    if (!m) return null
-    dx = +(m[1] ?? 0) / PX_PER_PT
-    dy = +(m[2] ?? 0) / PX_PER_PT
-  }
-  if (ps.position === 'relative') {
-    const rl = parseFloat(ps.left), rr = parseFloat(ps.right)
-    const rt = parseFloat(ps.top),  rb = parseFloat(ps.bottom)
-    dx += (isFinite(rl) ? rl : isFinite(rr) ? -rr : 0) / PX_PER_PT
-    dy += (isFinite(rt) ? rt : isFinite(rb) ? -rb : 0) / PX_PER_PT
-  }
-
-  const mlAuto = ps.marginLeft === 'auto', mrAuto = ps.marginRight === 'auto'
-  const spec: PseudoBoxSpec = {
-    anchor: 'flow', w, h, dx, dy,
-    mL: mlAuto ? null : pxToPt(ps.marginLeft  || '0px'),
-    mR: mrAuto ? null : pxToPt(ps.marginRight || '0px'),
-    mT: pxToPt(ps.marginTop    || '0px'),
-    mB: pxToPt(ps.marginBottom || '0px'),
-    fill:      bgCA ? [bgCA[0], bgCA[1], bgCA[2]] : null,
-    fillAlpha: bgCA ? bgCA[3] / 255 : 1,
-    gradient, border,
-    radius: clampRadiusToBox(parseBorderRadius(ps, undefined, { w, h }), w, h),
-  }
-
-  const elS = getComputedStyle(el)
-  if (ps.position === 'absolute' || ps.position === 'fixed') {
-    // offsets only resolve against the element's padding box when the element itself
-    // is the containing block; a statically-positioned pseudo needs layout we don't have
-    if (elS.position === 'static') return null
-    const hasH = isFinite(parseFloat(ps.left)) || isFinite(parseFloat(ps.right))
-    const hasV = isFinite(parseFloat(ps.top))  || isFinite(parseFloat(ps.bottom))
-    if (!hasH || !hasV) return null
-    spec.anchor = 'abs'
-    return spec
-  }
-
-  if (ps.position !== 'static' && ps.position !== 'relative') return null
-  // in-flow anchoring is only exact inside plain block containers — flex/grid make
-  // the pseudo an item, inline/table wrap it in anonymous boxes
-  const elD = elS.display
-  if (elD !== 'block' && elD !== 'inline-block' && elD !== 'list-item' &&
-      elD !== 'flow-root' && elD !== 'table-cell') return null
-
-  const d = ps.display
-  if (d === 'block' || d === 'flex' || d === 'grid' || d === 'flow-root') return spec
-  if (d === 'inline-block' && (ps.verticalAlign === 'baseline' || ps.verticalAlign === 'middle')) {
-    spec.anchor = 'probe'
-    return spec
-  }
-  return null
-}
-
-function emitPseudoBox(
-  el:        Element,
-  which:     '::before' | '::after',
-  ps:        CSSStyleDeclaration,
-  spec:      PseudoBoxSpec,
-  probeRect: DOMRect | null,
-  ctx:       WalkerCtx,
-): void {
-  const elR = domRectToPt(el.getBoundingClientRect(), ctx.containerRect)
-  const elS = getComputedStyle(el)
-  const bL = pxToPt(elS.borderLeftWidth || '0px'), bR = pxToPt(elS.borderRightWidth  || '0px')
-  const bT = pxToPt(elS.borderTopWidth  || '0px'), bB = pxToPt(elS.borderBottomWidth || '0px')
-
-  let x: number, y: number
-  if (spec.anchor === 'abs') {
-    const pL = elR.x + bL,          pT = elR.y + bT
-    const pR = elR.x + elR.w - bR,  pB = elR.y + elR.h - bB
-    const oL = parseFloat(ps.left), oR = parseFloat(ps.right)
-    const oT = parseFloat(ps.top),  oB = parseFloat(ps.bottom)
-    x = isFinite(oL) ? pL + oL / PX_PER_PT + (spec.mL ?? 0)
-                     : pR - oR / PX_PER_PT - spec.w - (spec.mR ?? 0)
-    y = isFinite(oT) ? pT + oT / PX_PER_PT + spec.mT
-                     : pB - oB / PX_PER_PT - spec.h - spec.mB
-  } else if (spec.anchor === 'flow') {
-    const cL = elR.x + bL + pxToPt(elS.paddingLeft || '0px')
-    const cR = elR.x + elR.w - bR - pxToPt(elS.paddingRight || '0px')
-    const cT = elR.y + bT + pxToPt(elS.paddingTop || '0px')
-    const cB = elR.y + elR.h - bB - pxToPt(elS.paddingBottom || '0px')
-    if (spec.mL === null && spec.mR === null) x = cL + (cR - cL - spec.w) / 2
-    else if (spec.mL === null)                x = cR - (spec.mR ?? 0) - spec.w
-    else                                      x = cL + spec.mL
-    // ::before is the first box in the content flow, ::after the last — anchor to the
-    // matching content-box edge (exact for the accent-bar idiom; the opposite-side
-    // margin may collapse away, so only the near-side margin participates)
-    y = which === '::before' ? cT + spec.mT : cB - spec.mB - spec.h
-  } else {
-    if (!probeRect) return
-    const probeLeft = (probeRect.left - ctx.containerRect.left) / PX_PER_PT
-    const baseline  = (probeRect.top  - ctx.containerRect.top)  / PX_PER_PT
-    // the probe sits after a ::before pseudo and before a ::after pseudo in DOM order
-    x = which === '::before'
-      ? probeLeft - (spec.mR ?? 0) - spec.w
-      : probeLeft + (spec.mL ?? 0)
-    if (ps.verticalAlign === 'middle') {
-      const xh = (parseFloat(ps.fontSize) || 16) / PX_PER_PT * 0.5
-      y = baseline - xh / 2 - spec.h / 2
-    } else {
-      // an empty inline-block's baseline is its bottom margin edge
-      y = baseline - spec.mB - spec.h
-    }
-  }
-  x += spec.dx
-  y += spec.dy
-
-  let gradient = spec.gradient
-  if (gradient) gradient = resolveGradientBox(gradient, spec.w, spec.h)
-
-  const elOp = parseFloat(ps.opacity)
-  const base = !isNaN(elOp) && elOp < 1 ? combineOpacity(stackOpacity(ctx), elOp) : stackOpacity(ctx)
-
-  for (const { page, y: ly } of paginateSpan(y, spec.h, ctx.pageH)) {
-    if (spec.fill || gradient) {
-      ctx.commands.push({
-        type: 'rect', page, x, y: ly, w: spec.w, h: spec.h,
-        fill: gradient ? null : spec.fill,
-        gradient,
-        radius: spec.radius,
-        opacity: gradient ? base : combineOpacity(base, spec.fillAlpha),
-      } as RectCommand)
-    }
-    if (spec.border) {
-      ctx.commands.push({
-        type: 'rect', page, x, y: ly, w: spec.w, h: spec.h,
-        fill: null,
-        stroke: spec.border.color,
-        strokeWidth: spec.border.w,
-        radius: spec.radius,
-        opacity: combineOpacity(base, spec.border.alpha),
-      } as RectCommand)
-    }
-  }
-}
-
-export async function capturePseudo(
-  el:    Element,
-  which: '::before' | '::after',
-  ctx:   WalkerCtx,
-): Promise<void> {
-  const ps = getComputedStyle(el, which)
-
-  // a pseudo that generates no box has no counter effect either, per spec
-  if (ps.display === 'none' || !ps.content || ps.content === 'none' || ps.content === 'normal') return
-  if (ps.visibility === 'hidden' || ps.visibility === 'collapse') return
-
-  // the pseudo's own counter-increment mutates the shared scope (persists for
-  // later content); any counter-reset it declares is scoped to the pseudo alone
-  const pseudoCounters = applyCounters(ctx.counters, ps)
-  try {
-    await capturePseudoContent(el, which, ps, ctx)
-  } finally {
-    popCounters(ctx.counters, pseudoCounters)
-  }
-}
-
-async function capturePseudoContent(
-  el:    Element,
-  which: '::before' | '::after',
-  ps:    CSSStyleDeclaration,
-  ctx:   WalkerCtx,
-): Promise<void> {
-  // strings, counter() and counters() resolve; anything else (attr(), quotes,
-  // url()) bails entirely rather than leaking raw CSS text into the output
-  const resolved = resolveContentList(ps.content, ctx.counters)
-  if (resolved === null) return
-
-  const psColorSrc = String((ps as any).webkitTextFillColor || ps.color)
-  const text = applyTextTransform(resolved, ps.textTransform)
-  const fontRef = text && !isTransparentColor(psColorSrc)
-    ? resolveFontRef(ps.fontFamily, ps.fontWeight, ps.fontStyle, ctx.fontMap, ctx.registeredFonts)
-    : null
-
-  const box = pseudoBoxSpec(el, ps)
-  if (!fontRef && !box) return
-
-  // zero-size probe with vertical-align:baseline — its top == the line's baseline
-  let probeRect: DOMRect | null = null
-  if (fontRef || box?.anchor === 'probe') {
-    const probe = document.createElement('span')
-    probe.style.cssText = 'display:inline;font-size:0;line-height:0;vertical-align:baseline;visibility:hidden;pointer-events:none;'
-    try {
-      if (which === '::before') el.insertBefore(probe, el.firstChild)
-      else el.appendChild(probe)
-      probeRect = probe.getBoundingClientRect()
-    } catch { /* detached or non-container element */ }
-    try { el.removeChild(probe) } catch { /* never inserted */ }
-  }
-
-  if (box) emitPseudoBox(el, which, ps, box, probeRect, ctx)
-
-  if (!fontRef || !probeRect) return
-
-  const sizePx = parseFloat(ps.fontSize) || 16
-  const sizePt = sizePx / PX_PER_PT
-  const xPt    = (probeRect.left - ctx.containerRect.left) / PX_PER_PT
-  const yPt    = (probeRect.top  - ctx.containerRect.top)  / PX_PER_PT
-  const { page, y: ly } = paginate(yPt, ctx.pageH)
-  const { color: colorRgb, alpha: colorAlpha } = splitColorAlpha(parseColorAlpha(psColorSrc))
-  const color   = colorRgb ?? ([0, 0, 0] as Color)
-  const opacity = stackOpacity(ctx)
-  const lsPt    = ps.letterSpacing === 'normal' ? undefined : pxToPt(ps.letterSpacing) || undefined
-
-  ctx.commands.push({
-    type: 'text', page,
-    text,
-    x: xPt, y: ly,
-    font: fontRef.name, style: fontRef.style, weight: fontRef.weight,
-    size: sizePt, color,
-    align: 'left',
-    maxWidth: ctx.pageW,
-    letterSpacing: lsPt,
-    opacity: combineOpacity(opacity, colorAlpha),
-  } as TextCommand)
 }

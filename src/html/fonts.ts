@@ -1,5 +1,6 @@
 import { list_registered_fonts } from '../../engine.js'
-import { font_has_glyph } from '../daepl/wasm/daepl.js'
+import { font_has_glyph } from '../daegun/wasm/daegun.js'
+import { isColorFont } from '../daegun/colorfonts.js'
 import type { FontRef } from '../types/index.js'
 import type { FontBridgeMap } from './types.js'
 
@@ -28,7 +29,7 @@ function hasGlyphCached(name: string, style: string, codepoint: number): boolean
 export function buildRegisteredFontMap(): Map<string, string[]> {
   if (_fontMapCache) return _fontMapCache
   const map  = new Map<string, string[]>()
-  const list = list_registered_fonts() as unknown as string[]
+  const list = list_registered_fonts()
   for (const entry of list) {
     const colon = entry.indexOf(':')
     if (colon < 0) continue
@@ -71,13 +72,15 @@ function pickStyle(
     if (s) return s
   }
   if (weight >= 500) {
-    const s = styles.find(x => x === 'bold' || isBold(x))
+    const s = styles.find(x => isBold(x) && !isItalic(x))
     if (s) return s
   } else {
     const s = styles.find(x => x === 'normal' || x === 'regular' || x === 'light' || x === 'thin')
     if (s) return s
   }
-  return styles[0]!
+  // the engine names faces normal or italic and picks the weight itself, so an upright
+  // request has to skip italic faces here or bold text prints slanted
+  return (italic ? undefined : styles.find(x => !isItalic(x))) ?? styles[0]!
 }
 
 function resolveOneFamily(
@@ -97,6 +100,16 @@ function resolveOneFamily(
   return style !== null ? { name: fam, style, weight } : null
 }
 
+function familyList(family: string): string[] {
+  return family.split(',').map(f => f.trim().replace(/^["']|["']$/g, '').trim())
+}
+
+// Chrome treats oblique from 14deg up as italic, both for face choice and for synthesis
+export function isSlanted(fStyle: string): boolean {
+  const m = fStyle.match(/^(italic|oblique)(?:\s+(-?[\d.]+)deg)?$/)
+  return !!m && (m[2] === undefined || parseFloat(m[2]) >= 14)
+}
+
 export function resolveFontRef(
   family:  string,
   weight:  string,
@@ -105,14 +118,25 @@ export function resolveFontRef(
   reg:     Map<string, string[]>,
 ): FontRef | null {
   const cssWeight = cssWeightNum(weight)
-  const italic    = fStyle === 'italic' || fStyle === 'oblique'
-  const families  = family.split(',').map(f => f.trim().replace(/^["']|["']$/g, '').trim())
+  const italic    = isSlanted(fStyle)
+  const families  = familyList(family)
 
   for (const fam of families) {
     const ref = resolveOneFamily(fam, cssWeight, italic, fontMap, reg)
     if (ref) return ref
   }
 
+  return null
+}
+
+function colorFontFor(
+  codepoint: number, family: string, weight: string, fStyle: string, fontMap: FontBridgeMap, reg: Map<string, string[]>,
+): FontRef | null {
+  const cssWeight = cssWeightNum(weight), italic = isSlanted(fStyle)
+  for (const fam of familyList(family)) {
+    const ref = resolveOneFamily(fam, cssWeight, italic, fontMap, reg)
+    if (ref && isColorFont(ref.name, ref.style) && hasGlyphCached(ref.name, ref.style, codepoint)) return ref
+  }
   return null
 }
 
@@ -125,7 +149,7 @@ export function resolveFontRef(
 // a font that actually has it instead of silently vanishing. Returns null
 // when nothing else covers it either — caller keeps the primary font's
 // .notdef, matching today's behavior for a genuinely unrenderable codepoint.
-export function resolveGlyphFallback(
+function resolveGlyphFallback(
   codepoint: number,
   primary:   FontRef,
   family:    string,
@@ -135,8 +159,8 @@ export function resolveGlyphFallback(
   reg:       Map<string, string[]>,
 ): FontRef | null {
   const cssWeight = cssWeightNum(weight)
-  const italic    = fStyle === 'italic' || fStyle === 'oblique'
-  const families  = family.split(',').map(f => f.trim().replace(/^["']|["']$/g, '').trim())
+  const italic    = isSlanted(fStyle)
+  const families  = familyList(family)
   const sameAsPrimary = (ref: FontRef) =>
     ref.name.toLowerCase() === primary.name.toLowerCase() && ref.style === primary.style
 
@@ -187,13 +211,24 @@ export function splitByFontCoverage(
 
   if (allPrimary) return [{ text, font: primary }]
 
+  // With the emoji presentation selector after it (❤️), a character takes the family's first color font
+  // that has it, as browsers do: Noto Color Emoji maps the selector only in a variation-sequence table
+  const fonts = chars.map(ch => fontFor.get(ch.codePointAt(0)!)!)
+  for (let i = 0; i + 1 < chars.length; i++) {
+    if (chars[i + 1] !== '\uFE0F') continue
+    const cp = chars[i]!.codePointAt(0)!, selector = fonts[i + 1]!
+    const emoji = colorFontFor(cp, family, weight, fStyle, fontMap, reg)
+      ?? (selector !== primary && hasGlyphCached(selector.name, selector.style, cp) ? selector : null)
+    if (emoji) { fonts[i] = emoji; fonts[i + 1] = emoji }
+  }
+
   const runs: FontRun[] = []
   let runStart = 0
-  let runFont  = fontFor.get(chars[0]!.codePointAt(0)!)!
+  let runFont  = fonts[0]!
   const sameRef = (a: FontRef, b: FontRef) => a.name === b.name && a.style === b.style && a.weight === b.weight
 
   for (let i = 1; i <= chars.length; i++) {
-    const nextFont = i < chars.length ? fontFor.get(chars[i]!.codePointAt(0)!)! : null
+    const nextFont = i < chars.length ? fonts[i]! : null
     if (nextFont && sameRef(nextFont, runFont)) continue
     runs.push({ text: chars.slice(runStart, i).join(''), font: runFont })
     runStart = i

@@ -20,7 +20,7 @@ export function resolvePageSize(size: PageSize, orientation?: 'portrait' | 'land
     // way renderHTMLtoPDF already throws immediately for an invalid pdfA+security
     // combination rather than let it surface as a much stranger failure downstream.
     if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
-      throw new Error(`[daepdf] Invalid custom page size {width: ${w}, height: ${h}} — both must be finite, positive numbers.`)
+      throw new Error(`[daepdf] Invalid custom page size {width: ${w}, height: ${h}} – both must be finite, positive numbers.`)
     }
   } else {
     const A4: [number, number] = [595.28, 841.89]

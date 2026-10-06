@@ -2,8 +2,11 @@ import { forEachChunk } from './pngchunks.js'
 
 export type SniffedFormat =
   | 'jpeg' | 'png' | 'tiff'
-  | 'gif' | 'bmp' | 'ico' | 'webp' | 'avif'
+  | 'gif' | 'bmp' | 'ico' | 'webp' | 'avif' | 'svg'
   | 'unknown'
+
+// SVG is markup, not a binary signature: a URL without an .svg extension still serves it
+const SVG_START = /^\s*(?:<\?xml[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*(?:<!DOCTYPE[^>]*>\s*)?<svg[\s>]/i
 
 export function sniffFormat(b: Uint8Array): SniffedFormat {
   if (b.length >= 2 && b[0] === 0xFF && b[1] === 0xD8) return 'jpeg'
@@ -29,6 +32,7 @@ export function sniffFormat(b: Uint8Array): SniffedFormat {
       if (tag(o) === 'avif' || tag(o) === 'avis') return 'avif'
     }
   }
+  if (SVG_START.test(new TextDecoder().decode(b.subarray(0, 1024)))) return 'svg'
   return 'unknown'
 }
 

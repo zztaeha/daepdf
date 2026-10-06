@@ -1,17 +1,17 @@
-import type { DrawCommand, ClipCommand, TransformCommand, BorderRadius, TextCommand, ImageCommand, RawImageCommand } from '../types/index.js'
+import type { DrawCommand, BorderRadius } from '../types/index.js'
 import {
-  domRectToPt, paginateSpan, cssBlendToPdf, PX_PER_PT, type WalkerCtx,
-  enterStruct, exitStruct, tagStructContent,
+  domRectToPt, paginateSpan, cssBlendToPdf, PX_PER_PT, type WalkerCtx, type StackLayer,
+  enterStruct, enterStructTag, exitStruct, tagStructContent,
 } from './types.js'
-import { parseBorderRadius, insetBorderRadius, splitByTopLevelComma, pxToPt } from './css.js'
+import { parseBorderRadius, insetBorderRadius, pxToPt } from './css.js'
 import { parseClipPath } from './clippath.js'
-import { applyCounters, popCounters } from './counters.js'
+import { applyCounters, applyListItemCounter, popCounters, resolveContentList } from './counters.js'
 import { hasBorderImage, emitBorderImage } from './borderimage.js'
-import { parseCSSMatrix, buildPdfTransformMatrix } from './transform.js'
+import { parseCSSMatrix } from './transform.js'
 import { hasFilter, emitFilteredElement } from './filters.js'
 import { hasMask, emitMaskedElement } from './mask.js'
-import { emitBox, emitListMarker, captureTextNode, captureVerticalTextNode, emitLinks, emitFormField, captureAnchor, capturePseudo } from './emit.js'
-import { emitImage, emitInlineSVG, emitCanvas, emitBgImage, extractBgUrl } from './images.js'
+import { emitBox, emitListMarker, captureTextNode, captureVerticalTextNode, emitLinks, emitFormField, captureAnchor, listIndex } from './emit.js'
+import { emitImage, emitInlineSVG, emitCanvas, resolveBgImages } from './images.js'
 
 const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'HEAD', 'TITLE', 'TEMPLATE'])
 
@@ -19,36 +19,24 @@ const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'HEAD'
 // normal horizontal one when the parent block is actually set vertically
 function captureAnyTextNode(node: Text, parent: Element, parentStyle: CSSStyleDeclaration, ctx: WalkerCtx): void {
   if (parentStyle.writingMode === 'vertical-rl' || parentStyle.writingMode === 'vertical-lr') {
-    captureVerticalTextNode(node, parent, parentStyle, ctx)
+    captureVerticalTextNode(node, parentStyle, ctx)
   } else {
     captureTextNode(node, parent, parentStyle, ctx)
   }
 }
 
-// D3: tags freshly-emitted text commands (which can be several — one per
-// page a text node's line spans, or one per word on a bidi/justify path)
-// to whatever structure element is innermost right now. A no-op array walk
-// when tagging is off, since tagStructContent itself short-circuits.
-function tagTextCommands(ctx: WalkerCtx, cmds: DrawCommand[]): void {
-  if (!ctx.struct) return
-  for (const cmd of cmds) {
-    if (cmd.type !== 'text') continue
-    const tagged = tagStructContent(ctx, cmd.page)
-    if (tagged) { (cmd as TextCommand).mcid = tagged.mcid; (cmd as TextCommand).structTag = tagged.tag }
-  }
-}
+// D3: tags freshly emitted content (one command per page a run spans, or one per word on a
+// bidi/justify path) to the innermost structure element; the rest is marked as artifacts
+const TEXT_CONTENT:   ReadonlySet<DrawCommand['type']> = new Set(['text'])
+const FIGURE_CONTENT: ReadonlySet<DrawCommand['type']> = new Set(['image', 'raw-image', 'path'])
+const MARKER_CONTENT: ReadonlySet<DrawCommand['type']> = new Set(['text', 'path'])
 
-// D3: same idea as tagTextCommands, for the one (or few, if paginated
-// across a break) ImageCommand/RawImageCommand a <img>/inline <svg> produces
-function tagImageCommands(ctx: WalkerCtx, cmds: DrawCommand[]): void {
+function tagContent(ctx: WalkerCtx, cmds: DrawCommand[], types: ReadonlySet<DrawCommand['type']>): void {
   if (!ctx.struct) return
   for (const cmd of cmds) {
-    if (cmd.type !== 'image' && cmd.type !== 'raw-image') continue
+    if (!types.has(cmd.type)) continue
     const tagged = tagStructContent(ctx, cmd.page)
-    if (tagged) {
-      const c = cmd as ImageCommand | RawImageCommand
-      c.mcid = tagged.mcid; c.structTag = tagged.tag
-    }
+    if (tagged) Object.assign(cmd, { mcid: tagged.mcid, structTag: tagged.tag })
   }
 }
 
@@ -83,70 +71,67 @@ export async function walkChildren(
   parentStyle: CSSStyleDeclaration,
   ctx:         WalkerCtx,
 ): Promise<void> {
-  const children = Array.from(parent.childNodes)
-
-  let needsZSort = false
-  for (const child of children) {
-    if (child.nodeType !== Node.ELEMENT_NODE) continue
-    if (getComputedStyle(child as Element).position !== 'static') { needsZSort = true; break }
-  }
-
   // counters a child resets stay in scope for its FOLLOWING SIBLINGS — they
   // pop when this parent finishes its children, not when the child exits
   const childCounters: string[] = []
-
-  if (!needsZSort) {
-    for (const child of children) {
-      if (child.nodeType === Node.TEXT_NODE) {
-        const startIdx = ctx.commands.length
-        captureAnyTextNode(child as Text, parent, parentStyle, ctx)
-        tagTextCommands(ctx, ctx.commands.slice(startIdx))
-      } else if (child.nodeType === Node.ELEMENT_NODE) {
-        childCounters.push(...await walkElement(child as Element, ctx))
-      }
-    }
-    popCounters(ctx.counters, childCounters)
-    return
-  }
-
-  // CSS painting order (simplified Appendix E): negative z-index → in-flow content in
-  // DOM order → positioned elements with z-index auto/0 in DOM order → positive
-  // z-index. Positioned elements paint above their in-flow siblings even WITHOUT a
-  // z-index — plain DOM order put an early absolutely-positioned badge underneath
-  // later static content that the browser draws it on top of.
-  interface Layer { z: number; group: number; commands: DrawCommand[] }
-  const layers: Layer[] = []
-
-  for (const child of children) {
-    const subCtx: WalkerCtx = { ...ctx, commands: [], opacityStack: [...ctx.opacityStack], blendStack: [...ctx.blendStack] }
-
+  for (const child of Array.from(parent.childNodes)) {
     if (child.nodeType === Node.TEXT_NODE) {
-      captureAnyTextNode(child as Text, parent, parentStyle, subCtx)
-      tagTextCommands(ctx, subCtx.commands)
-      layers.push({ z: 0, group: 1, commands: subCtx.commands })
+      const startIdx = ctx.commands.length
+      captureAnyTextNode(child as Text, parent, parentStyle, ctx)
+      tagContent(ctx, ctx.commands.slice(startIdx), TEXT_CONTENT)
     } else if (child.nodeType === Node.ELEMENT_NODE) {
-      const childEl     = child as Element
-      const cs          = getComputedStyle(childEl)
-      const positioned  = cs.position !== 'static'
-      const zRaw        = parseInt(cs.zIndex, 10)
-      const z           = positioned && !isNaN(zRaw) ? zRaw : 0
-      const group       = !positioned ? 1 : z < 0 ? 0 : z > 0 ? 3 : 2
-
-      childCounters.push(...await walkElement(childEl, subCtx))
-      layers.push({ z, group, commands: subCtx.commands })
+      ctx.siblingCounters = childCounters
+      childCounters.push(...await walkChild(child as Element, parentStyle, ctx))
     }
   }
   popCounters(ctx.counters, childCounters)
+}
 
-  const ordered = [
-    ...layers.filter(l => l.group === 0).sort((a, b) => a.z - b.z),
-    ...layers.filter(l => l.group === 1),
-    ...layers.filter(l => l.group === 2),
-    ...layers.filter(l => l.group === 3).sort((a, b) => a.z - b.z),
-  ]
-  for (const layer of ordered) {
-    for (const cmd of layer.commands) ctx.commands.push(cmd)
+// Positioned elements, and flex or grid items with a z-index, paint in a layer of the
+// enclosing stacking context rather than in place; null means normal flow
+function paintLayerZ(el: Element, parentStyle: CSSStyleDeclaration): number | null {
+  const s = getComputedStyle(el)
+  const z = parseInt(s.zIndex, 10)
+  if (!isNaN(z) && (s.position !== 'static' || /flex|grid/.test(parentStyle.display))) return z
+  return s.position !== 'static' ? 0 : null
+}
+
+// The layer is registered before the walk, so layers keep tree order within a z
+async function walkChild(el: Element, parentStyle: CSSStyleDeclaration, ctx: WalkerCtx): Promise<string[]> {
+  const z = ctx.stacking ? paintLayerZ(el, parentStyle) : null
+  if (z === null) return walkElement(el, ctx)
+  const layer: StackLayer = { z, commands: [] }
+  ctx.stacking!.push(layer)
+  return walkElement(el, { ...ctx, commands: layer.commands, opacityStack: [...ctx.opacityStack], blendStack: [...ctx.blendStack] })
+}
+
+function isStackingContext(el: Element, s: CSSStyleDeclaration): boolean {
+  if (s.zIndex !== 'auto' && (s.position !== 'static' || /flex|grid/.test(getComputedStyle(el.parentElement ?? el).display))) return true
+  const any = s as any
+  return s.position === 'fixed' || s.position === 'sticky' || parseFloat(s.opacity) < 1 || s.transform !== 'none' ||
+    s.mixBlendMode !== 'normal' || s.isolation === 'isolate' || (any.clipPath ?? 'none') !== 'none' ||
+    s.perspective !== 'none' || (any.backdropFilter ?? 'none') !== 'none' || /layout|paint|strict|content/.test(s.contain) ||
+    /transform|opacity|perspective|isolation|mix-blend-mode|clip-path|mask|filter/.test(s.willChange)
+}
+
+// CSS painting order (simplified Appendix E): negative z layers, then the normal flow, then
+// positioned layers by z, ties in tree order. Layers come from any depth below the context.
+export async function paintStackingContext(ctx: WalkerCtx, paint: () => Promise<void>): Promise<void> {
+  const outer = ctx.stacking
+  const layers: StackLayer[] = []
+  ctx.stacking = layers
+  const at = ctx.commands.length
+  try {
+    await paint()
+  } finally {
+    ctx.stacking = outer
   }
+  if (!layers.length) return
+  layers.sort((a, b) => a.z - b.z)
+  const flow = ctx.commands.splice(at)
+  for (const layer of layers) if (layer.z < 0) for (const c of layer.commands) ctx.commands.push(c)
+  for (const c of flow) ctx.commands.push(c)
+  for (const layer of layers) if (layer.z >= 0) for (const c of layer.commands) ctx.commands.push(c)
 }
 
 // returns the counter names this element's own reset/set/increment pushed —
@@ -213,7 +198,7 @@ async function captureTransformedElement(
   // matrix3d (3D transforms) has no 2D equivalent to fall back to safely —
   // render untransformed rather than risk a wrong projection
   if (!rawMatrix) {
-    console.warn('[daepdf] 3D transforms (matrix3d/perspective) are not supported — element rendered untransformed.')
+    console.warn('[daepdf] 3D transforms (matrix3d/perspective) are not supported – element rendered untransformed.')
     return walkElementBody(el, tag, s, ctx)
   }
   // a,b,c,d are unitless ratios (unaffected by the px/pt scale), but e,f are the
@@ -224,42 +209,63 @@ async function captureTransformedElement(
     rawMatrix[4] / PX_PER_PT, rawMatrix[5] / PX_PER_PT,
   ]
 
+  // transform-origin always resolves to absolute "Npx Mpx" (a possible 3rd
+  // z-value is irrelevant for a 2D matrix); read before the override below
+  const [oxStr, oyStr] = s.transformOrigin.split(/\s+/)
   const htmlEl = el as HTMLElement
   const savedInline = htmlEl.style.transform
   htmlEl.style.transform = 'none'
-  const boxRect = el.getBoundingClientRect()
-  const { x: boxX, y: boxY } = domRectToPt(boxRect, ctx.containerRect)
-
-  // transform-origin always resolves to absolute "Npx Mpx" (a possible 3rd
-  // z-value is irrelevant for a 2D matrix)
-  const [oxStr, oyStr] = s.transformOrigin.split(/\s+/)
-  const originX = boxX + (parseFloat(oxStr ?? '') || 0) / PX_PER_PT
-  const originY = boxY + (parseFloat(oyStr ?? '') || 0) / PX_PER_PT
-
   const subCtx: WalkerCtx = { ...ctx, commands: [], opacityStack: [...ctx.opacityStack], blendStack: [...ctx.blendStack] }
-  const counters = await walkElementBody(el, tag, s, subCtx)
+  let originX: number, originY: number, counters: string[]
+  try {
+    const { x: boxX, y: boxY } = domRectToPt(el.getBoundingClientRect(), ctx.containerRect)
+    originX = boxX + (parseFloat(oxStr ?? '') || 0) / PX_PER_PT
+    originY = boxY + (parseFloat(oyStr ?? '') || 0) / PX_PER_PT
+    counters = await walkElementBody(el, tag, s, subCtx, true)
+  } finally {
+    // fromDOM may be walking the caller's live element
+    htmlEl.style.transform = savedInline
+  }
 
-  htmlEl.style.transform = savedInline
-
-  const matrix = buildPdfTransformMatrix(cssMatrix, originX, originY, ctx.pageH)
+  // annotations sit outside the content stream, where the cm below never reaches them,
+  // so their boxes go through the CSS matrix here (as the bounding box of the result)
+  const [ma, mb, mc, md, me, mf] = cssMatrix
+  for (const cmd of subCtx.commands) {
+    if (cmd.type !== 'link' && cmd.type !== 'field') continue
+    const off = (cmd.page - 1) * ctx.pageH
+    const xs: number[] = [], ys: number[] = []
+    for (const [px, py] of [[cmd.x, cmd.y], [cmd.x + cmd.w, cmd.y], [cmd.x, cmd.y + cmd.h], [cmd.x + cmd.w, cmd.y + cmd.h]] as const) {
+      const dx = px - originX, dy = py + off - originY
+      xs.push(originX + ma * dx + mc * dy + me)
+      ys.push(originY + mb * dx + md * dy + mf - off)
+    }
+    cmd.x = Math.min(...xs); cmd.w = Math.max(...xs) - cmd.x
+    cmd.y = Math.min(...ys); cmd.h = Math.max(...ys) - cmd.y
+  }
 
   // mirrors clip-push/pop's own multi-page pattern: each page this subtree's
   // commands touch gets its own push/pop pair, routed into that page's own
-  // buffer independently of where they fall in the flat command array
+  // buffer independently of where they fall in the flat command array. Each
+  // page's content is in that page's coordinates, so the pivot is too.
   const pages = [...new Set(subCtx.commands.map(c => c.page))].sort((a, b) => a - b)
-  for (const page of pages) ctx.commands.push({ type: 'transform-push', page, matrix } as TransformCommand)
+  for (const page of pages) {
+    ctx.commands.push({ type: 'transform-push', page, css: cssMatrix, origin: [originX, originY - (page - 1) * ctx.pageH] })
+  }
   for (const cmd of subCtx.commands) ctx.commands.push(cmd)
-  for (const page of pages) ctx.commands.push({ type: 'transform-pop', page } as TransformCommand)
+  for (const page of pages) ctx.commands.push({ type: 'transform-pop', page })
 
   return counters
 }
 
-async function walkElementBody(el: Element, tag: string, s: CSSStyleDeclaration, ctx: WalkerCtx): Promise<string[]> {
+// ownContext: the caller knows el is a stacking context even if s no longer shows it
+async function walkElementBody(el: Element, tag: string, s: CSSStyleDeclaration, ctx: WalkerCtx, ownContext = false): Promise<string[]> {
   // visibility:hidden suppresses only this element's own painting — a descendant with
   // visibility:visible still renders, so the subtree must still be walked
   const hiddenSelf = s.visibility === 'hidden' || s.visibility === 'collapse'
 
-  const ownCounters = applyCounters(ctx.counters, s)
+  const siblings = ctx.siblingCounters ?? []
+  const ownCounters = applyCounters(ctx.counters, s, siblings)
+  ownCounters.push(...applyListItemCounter(ctx.counters, el, s, () => listIndex(el), siblings))
 
   captureAnchor(el, ctx)
 
@@ -300,11 +306,11 @@ async function walkElementBody(el: Element, tag: string, s: CSSStyleDeclaration,
   const clipPathVal = (s as any).clipPath as string | undefined
   if (clipPathVal && clipPathVal !== 'none') {
     const box = domRectToPt(el.getBoundingClientRect(), ctx.containerRect)
-    const shape = parseClipPath(clipPathVal, box)
+    const shape = parseClipPath(clipPathVal, box, s)
     if (shape?.kind === 'rect') {
       const spans = paginateSpan(shape.y, Math.max(shape.h, 1e-3), ctx.pageH)
       for (const { page, y: ly } of spans) {
-        ctx.commands.push({ type: 'clip-push', page, x: shape.x, y: ly, w: shape.w, h: shape.h, radius: shape.radius } as ClipCommand)
+        ctx.commands.push({ type: 'clip-push', page, x: shape.x, y: ly, w: shape.w, h: shape.h, radius: shape.radius })
       }
       clipPathSpans = spans
     } else if (shape?.kind === 'path') {
@@ -314,29 +320,34 @@ async function walkElementBody(el: Element, tag: string, s: CSSStyleDeclaration,
       for (const { page, y: ly } of spans) {
         const dy  = ly - minY
         const ops = shape.ops.map(seg => ({ op: seg.op, args: seg.args.map((v, i) => i % 2 === 1 ? v + dy : v) }))
-        ctx.commands.push({ type: 'clip-push', page, path: ops, evenOdd: shape.evenOdd } as ClipCommand)
+        ctx.commands.push({ type: 'clip-push', page, path: ops, evenOdd: shape.evenOdd })
       }
       clipPathSpans = spans
     }
   }
   const popClipPath = () => {
-    for (const { page } of clipPathSpans) ctx.commands.push({ type: 'clip-pop', page } as ClipCommand)
+    for (const { page } of clipPathSpans) ctx.commands.push({ type: 'clip-pop', page })
   }
 
   if (tag === 'SVG') {
     if (!hiddenSelf) {
       const startIdx = ctx.commands.length
       await emitInlineSVG(el as SVGSVGElement, ctx)
-      tagImageCommands(ctx, ctx.commands.slice(startIdx))
+      tagContent(ctx, ctx.commands.slice(startIdx), FIGURE_CONTENT)
     }
     popClipPath()
     popStacks()
     return ownCounters
   }
 
+  // a list item's marker goes in an Lbl, its content in an LBody
+  const listItem = ctx.struct?.stack.at(-1)?.tag === 'LI'
   if (!hiddenSelf) {
-    emitBox(el, s, ctx)
+    emitBox(el, s, ctx, await resolveBgImages(s))
+    const lbl = listItem ? enterStructTag(ctx, 'Lbl') : undefined
+    const markerAt = ctx.commands.length
     emitListMarker(el, s, ctx)
+    if (lbl) { tagContent(ctx, ctx.commands.slice(markerAt), MARKER_CONTENT); exitStruct(ctx, lbl) }
     // border-image paints over the CSS border emitBox already suppressed for
     // this element — same "part of the element's own decoration" treatment,
     // so it also happens before the overflow clip-push below
@@ -353,45 +364,30 @@ async function walkElementBody(el: Element, tag: string, s: CSSStyleDeclaration,
   // Command array order guarantees each page's stream sees push → children → pop;
   // popping per page keeps every stream's q/Q stack LIFO-balanced.
   let clipSpans: Array<{ page: number; y: number }> = []
-  let clipRegion: ReturnType<typeof paddingBoxClip> | null = null
   if (needsClip) {
     const r = el.getBoundingClientRect()
     const { x, y, w, h } = domRectToPt(r, ctx.containerRect)
-    clipRegion = paddingBoxClip(x, y, w, h, parseBorderRadius(s, el), s)
-    clipSpans  = paginateSpan(clipRegion.y, Math.max(clipRegion.h, 1e-3), ctx.pageH)
+    const clipRegion = paddingBoxClip(x, y, w, h, parseBorderRadius(s, el), s)
+    clipSpans = paginateSpan(clipRegion.y, Math.max(clipRegion.h, 1e-3), ctx.pageH)
     for (const { page, y: ly } of clipSpans) {
       ctx.commands.push({
         type: 'clip-push', page, x: clipRegion.x, y: ly, w: clipRegion.w, h: clipRegion.h,
         radius: clipRegion.radius,
-      } as ClipCommand)
+      })
     }
   }
   const popClips = () => {
     for (const { page } of clipSpans) {
-      ctx.commands.push({ type: 'clip-pop', page } as ClipCommand)
+      ctx.commands.push({ type: 'clip-pop', page })
     }
     popClipPath()
-  }
-
-  // CSS background-image URL — iterate layers so url() works even when not the first layer
-  // emitted after clip-push so the image respects overflow:hidden / border-radius clipping.
-  // Layer index is passed through so size/position/repeat (each their own comma-separated,
-  // cyclically-repeating list per the spec) resolve against the matching layer, not layer 0.
-  // CSS paints image layers LAST → FIRST (the first listed layer ends up on top), so
-  // iterate reversed. Gradient/conic layers are painted by emitBox in their paint slot.
-  if (!hiddenSelf && s.backgroundImage && s.backgroundImage !== 'none') {
-    const layers = splitByTopLevelComma(s.backgroundImage)
-    for (let i = layers.length - 1; i >= 0; i--) {
-      const url = extractBgUrl((layers[i] ?? '').trim())
-      if (url) await emitBgImage(el, url, ctx, i, layers.length)
-    }
   }
 
   if (tag === 'IMG') {
     if (!hiddenSelf) {
       const startIdx = ctx.commands.length
       await emitImage(el as HTMLImageElement, ctx)
-      tagImageCommands(ctx, ctx.commands.slice(startIdx))
+      tagContent(ctx, ctx.commands.slice(startIdx), FIGURE_CONTENT)
     }
     popClips()
     popStacks()
@@ -405,9 +401,8 @@ async function walkElementBody(el: Element, tag: string, s: CSSStyleDeclaration,
     return ownCounters
   }
 
-  // D1 (AcroForm): INPUT/TEXTAREA/SELECT become a real form field — see
-  // emitFormField for which input types qualify. No struct-tree tagging
-  // (D3) attempted for these, a stated scope cut.
+  // D1 (AcroForm): INPUT/TEXTAREA/SELECT become a real form field (emitFormField says which
+  // input types qualify); tagged output places each in a Form structure element
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
     if (!hiddenSelf) emitFormField(el, s, ctx)
     popClips()
@@ -417,13 +412,74 @@ async function walkElementBody(el: Element, tag: string, s: CSSStyleDeclaration,
 
   if (tag === 'A' && !hiddenSelf) emitLinks(el as HTMLAnchorElement, ctx)
 
-  await capturePseudo(el, '::before', ctx)
-
-  await walkChildren(el, s, ctx)
-
-  await capturePseudo(el, '::after', ctx)
+  const paintContent = async () => {
+    await capturePseudo(el, '::before', s, ctx)
+    await walkChildren(el, s, ctx)
+    await capturePseudo(el, '::after', s, ctx)
+  }
+  const lbody = listItem ? enterStructTag(ctx, 'LBody') : undefined
+  // a clip keeps its positioned descendants, so they can't escape the clip-pop
+  if (ownContext || needsClip || isStackingContext(el, s)) await paintStackingContext(ctx, paintContent)
+  else await paintContent()
+  exitStruct(ctx, lbody)
 
   popClips()
   popStacks()
   return ownCounters
+}
+
+const PSEUDO_ATTR = 'data-tpdf-pseudo'
+// counters are applied by capturePseudo itself, content means nothing on a real element, and
+// animations or transitions would restart on the copy instead of keeping the computed frame
+const NOT_COPIED = new Set(['content', 'counter-reset', 'counter-increment', 'counter-set'])
+const notCopied = (prop: string) => NOT_COPIED.has(prop) || prop.startsWith('animation') || prop.startsWith('transition')
+
+function ensurePseudoOffRule(doc: Document): void {
+  if (doc.head.querySelector('style[data-tpdf-pseudo-off]')) return
+  const style = doc.createElement('style')
+  style.dataset['tpdfPseudoOff'] = ''
+  style.textContent = `[${PSEUDO_ATTR}~="before"]::before,[${PSEUDO_ATTR}~="after"]::after{content:none!important}`
+  doc.head.appendChild(style)
+}
+
+// A pseudo-element has no node to measure, so it is captured as a real one: a span carrying
+// its computed style and resolved content, in its place while the pseudo itself is switched off.
+async function capturePseudo(el: Element, which: '::before' | '::after', s: CSSStyleDeclaration, ctx: WalkerCtx): Promise<void> {
+  const ps = getComputedStyle(el, which)
+  if (ps.display === 'none' || !ps.content || ps.content === 'none' || ps.content === 'normal') return
+
+  // the pseudo's own counter-increment persists for later content; a reset it declares is
+  // scoped to the pseudo alone
+  const pushed = applyCounters(ctx.counters, ps)
+  try {
+    // strings, counter() and counters() resolve; attr(), quotes and url() bail entirely
+    // rather than leak raw CSS text into the output
+    const text = resolveContentList(ps.content, ctx.counters)
+    if (text === null) return
+
+    const doc = el.ownerDocument
+    ensurePseudoOffRule(doc)
+    const stand = doc.createElement('span')
+    for (let i = 0; i < ps.length; i++) {
+      const prop = ps[i]!
+      if (!notCopied(prop)) stand.style.setProperty(prop, ps.getPropertyValue(prop))
+    }
+    stand.textContent = text
+
+    const side = which === '::before' ? 'before' : 'after'
+    const prev = el.getAttribute(PSEUDO_ATTR)
+    el.setAttribute(PSEUDO_ATTR, prev ? `${prev} ${side}` : side)
+    if (which === '::before') el.insertBefore(stand, el.firstChild)
+    else el.appendChild(stand)
+    try {
+      ctx.siblingCounters = []
+      await walkChild(stand, s, ctx)
+    } finally {
+      stand.remove()
+      if (prev === null) el.removeAttribute(PSEUDO_ATTR)
+      else el.setAttribute(PSEUDO_ATTR, prev)
+    }
+  } finally {
+    popCounters(ctx.counters, pushed)
+  }
 }

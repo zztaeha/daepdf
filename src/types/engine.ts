@@ -7,17 +7,6 @@ export interface ParsedImage {
   isJpeg:       boolean
   decodeInvert: boolean
   orientation:  number
-}
-
-export interface SubsetFontResult {
-  fontBytes:   Uint8Array | null
-  glyphMap:    Uint16Array | null
-  isCff:       boolean
-  ascender:    number
-  descender:   number
-  capHeight:   number
-  bbox:        [number, number, number, number]
-  flags:       number
-  italicAngle: number
-  fontName:    string
+  // the image's own ICC profile, when it carries one that matches its channels
+  icc?:         Uint8Array | null | undefined
 }

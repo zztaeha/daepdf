@@ -76,8 +76,6 @@ export function sha256(data: Uint8Array): Uint8Array {
   return out
 }
 
-const MASK64 = (1n << 64n) - 1n
-
 type State64 = [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint]
 
 const H512: State64 = [
@@ -113,65 +111,85 @@ const K512 = [
   0x4cc5d4becb3e42b6n, 0x597f299cfc657e2an, 0x5fcb6fab3ad6faecn, 0x6c44198c4a475817n,
 ]
 
-function rotr64(x: bigint, n: bigint): bigint {
-  return ((x >> n) | (x << (64n - n))) & MASK64
-}
+// The 64-bit words run as hi/lo 32-bit halves: BigInt arithmetic was ~20x slower, and the
+// R6 hardened hash calls this at least 128 times per document. Constants stay BigInt above.
+const K_HI = Int32Array.from(K512, k => Number(k >> 32n))
+const K_LO = Int32Array.from(K512, k => Number(k & 0xffffffffn))
+const TWO32 = 4294967296
 
 // shared by SHA-512 and SHA-384 — same compression function, only the
 // initial hash value and output truncation differ (FIPS 180-4 §5.3.4)
-function sha512Core(data: Uint8Array, init: State64): State64 {
-  const bitLen = BigInt(data.length) * 8n
+function sha512Core(data: Uint8Array, init: State64, outLen: number): Uint8Array {
   const padLen = ((112 - (data.length + 1) % 128) + 128) % 128
   const msg = new Uint8Array(data.length + 1 + padLen + 16)
   msg.set(data)
   msg[data.length] = 0x80
-  // length is a 128-bit big-endian count; our inputs never approach 2^64
-  // bits, so the high 8 bytes are always zero and only the low 8 matter
-  const lenView = new DataView(msg.buffer, msg.length - 8, 8)
-  lenView.setBigUint64(0, bitLen, false)
-
-  let [h0, h1, h2, h3, h4, h5, h6, h7] = init
-  const w = new Array<bigint>(80)
+  // length is a 128-bit big-endian bit count; our inputs never approach 2^53 bits
   const view = new DataView(msg.buffer)
+  const bits = data.length * 8
+  view.setUint32(msg.length - 8, Math.floor(bits / TWO32), false)
+  view.setUint32(msg.length - 4, bits >>> 0, false)
+
+  const H = new Int32Array(16)
+  for (const [i, v] of init.entries()) { H[2 * i] = Number(v >> 32n); H[2 * i + 1] = Number(v & 0xffffffffn) }
+  const W = new Int32Array(160)
 
   for (let base = 0; base < msg.length; base += 128) {
-    for (let t = 0; t < 16; t++) w[t] = view.getBigUint64(base + t * 8, false)
+    for (let t = 0; t < 32; t++) W[t] = view.getInt32(base + t * 4, false)
     for (let t = 16; t < 80; t++) {
-      const x15 = w[t-15]!, x2 = w[t-2]!
-      const s0 = (rotr64(x15, 1n) ^ rotr64(x15, 8n) ^ (x15 >> 7n)) & MASK64
-      const s1 = (rotr64(x2, 19n) ^ rotr64(x2, 61n) ^ (x2 >> 6n)) & MASK64
-      w[t] = (w[t-16]! + s0 + w[t-7]! + s1) & MASK64
+      const xh = W[2 * (t - 15)]!, xl = W[2 * (t - 15) + 1]!
+      const yh = W[2 * (t - 2)]!, yl = W[2 * (t - 2) + 1]!
+      // σ0 = rotr1 ^ rotr8 ^ shr7, σ1 = rotr19 ^ rotr61 ^ shr6
+      const s0h = ((xh >>> 1) | (xl << 31)) ^ ((xh >>> 8) | (xl << 24)) ^ (xh >>> 7)
+      const s0l = ((xl >>> 1) | (xh << 31)) ^ ((xl >>> 8) | (xh << 24)) ^ ((xl >>> 7) | (xh << 25))
+      const s1h = ((yh >>> 19) | (yl << 13)) ^ ((yl >>> 29) | (yh << 3)) ^ (yh >>> 6)
+      const s1l = ((yl >>> 19) | (yh << 13)) ^ ((yh >>> 29) | (yl << 3)) ^ ((yl >>> 6) | (yh << 26))
+      const lo = (W[2 * (t - 16) + 1]! >>> 0) + (s0l >>> 0) + (W[2 * (t - 7) + 1]! >>> 0) + (s1l >>> 0)
+      W[2 * t] = W[2 * (t - 16)]! + s0h + W[2 * (t - 7)]! + s1h + Math.floor(lo / TWO32)
+      W[2 * t + 1] = lo
     }
 
-    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7
+    let ah = H[0]!, al = H[1]!, bh = H[2]!, bl = H[3]!, ch = H[4]!, cl = H[5]!, dh = H[6]!, dl = H[7]!
+    let eh = H[8]!, el = H[9]!, fh = H[10]!, fl = H[11]!, gh = H[12]!, gl = H[13]!, hh = H[14]!, hl = H[15]!
     for (let t = 0; t < 80; t++) {
-      const S1 = (rotr64(e, 14n) ^ rotr64(e, 18n) ^ rotr64(e, 41n)) & MASK64
-      const ch = (e & f) ^ (~e & MASK64 & g)
-      const t1 = (hh + S1 + ch + K512[t]! + w[t]!) & MASK64
-      const S0 = (rotr64(a, 28n) ^ rotr64(a, 34n) ^ rotr64(a, 39n)) & MASK64
-      const maj = (a & b) ^ (a & c) ^ (b & c)
-      const t2 = (S0 + maj) & MASK64
-      hh = g; g = f; f = e; e = (d + t1) & MASK64
-      d = c; c = b; b = a; a = (t1 + t2) & MASK64
+      // Σ1(e) = rotr14 ^ rotr18 ^ rotr41, Σ0(a) = rotr28 ^ rotr34 ^ rotr39
+      const S1h = ((eh >>> 14) | (el << 18)) ^ ((eh >>> 18) | (el << 14)) ^ ((el >>> 9) | (eh << 23))
+      const S1l = ((el >>> 14) | (eh << 18)) ^ ((el >>> 18) | (eh << 14)) ^ ((eh >>> 9) | (el << 23))
+      const chh = (eh & fh) ^ (~eh & gh), chl = (el & fl) ^ (~el & gl)
+      // low halves sum as unsigned doubles; whatever passes 2^32 carries into the high half
+      const t1x = (hl >>> 0) + (S1l >>> 0) + (chl >>> 0) + (K_LO[t]! >>> 0) + (W[2 * t + 1]! >>> 0)
+      const t1h = (hh + S1h + chh + K_HI[t]! + W[2 * t]! + Math.floor(t1x / TWO32)) | 0, t1l = t1x >>> 0
+      const S0h = ((ah >>> 28) | (al << 4)) ^ ((al >>> 2) | (ah << 30)) ^ ((al >>> 7) | (ah << 25))
+      const S0l = ((al >>> 28) | (ah << 4)) ^ ((ah >>> 2) | (al << 30)) ^ ((ah >>> 7) | (al << 25))
+      const majh = (ah & bh) ^ (ah & ch) ^ (bh & ch), majl = (al & bl) ^ (al & cl) ^ (bl & cl)
+      const t2x = (S0l >>> 0) + (majl >>> 0)
+      const t2h = (S0h + majh + Math.floor(t2x / TWO32)) | 0, t2l = t2x >>> 0
+      hh = gh; hl = gl; gh = fh; gl = fl; fh = eh; fl = el
+      const ex = (dl >>> 0) + t1l
+      eh = (dh + t1h + Math.floor(ex / TWO32)) | 0; el = ex | 0
+      dh = ch; dl = cl; ch = bh; cl = bl; bh = ah; bl = al
+      const ax = t1l + t2l
+      ah = (t1h + t2h + Math.floor(ax / TWO32)) | 0; al = ax | 0
     }
-    h0 = (h0+a)&MASK64; h1 = (h1+b)&MASK64; h2 = (h2+c)&MASK64; h3 = (h3+d)&MASK64
-    h4 = (h4+e)&MASK64; h5 = (h5+f)&MASK64; h6 = (h6+g)&MASK64; h7 = (h7+hh)&MASK64
+    const add = (i: number, h: number, l: number) => {
+      const lo = (H[i + 1]! >>> 0) + (l >>> 0)
+      H[i] = H[i]! + h + Math.floor(lo / TWO32); H[i + 1] = lo
+    }
+    add(0, ah, al); add(2, bh, bl); add(4, ch, cl); add(6, dh, dl)
+    add(8, eh, el); add(10, fh, fl); add(12, gh, gl); add(14, hh, hl)
   }
-  return [h0, h1, h2, h3, h4, h5, h6, h7]
-}
 
-function bigintsToBytes(words: State64, byteLen: number): Uint8Array {
-  const out = new Uint8Array(words.length * 8)
-  const view = new DataView(out.buffer)
-  for (const [i, v] of words.entries()) view.setBigUint64(i * 8, v, false)
-  return out.subarray(0, byteLen)
+  const out = new Uint8Array(64)
+  const ov = new DataView(out.buffer)
+  for (let i = 0; i < 16; i++) ov.setInt32(i * 4, H[i]!, false)
+  return out.subarray(0, outLen)
 }
 
 export function sha512(data: Uint8Array): Uint8Array {
-  return bigintsToBytes(sha512Core(data, H512), 64)
+  return sha512Core(data, H512, 64)
 }
 
 // truncated to the first 384 of 512 bits (first 6 of 8 words) per spec
 export function sha384(data: Uint8Array): Uint8Array {
-  return bigintsToBytes(sha512Core(data, H384), 48)
+  return sha512Core(data, H384, 48)
 }

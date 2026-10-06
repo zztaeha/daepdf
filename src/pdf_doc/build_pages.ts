@@ -2,8 +2,20 @@ import type { InternalCtx, PageAnnot } from './types.js'
 import { hpf, _te, uriString } from './utils.js'
 import { deflate } from './deflate.js'
 
+// annotation flag Print (ISO 32000-1 table 165): without it a field's value is left out
+// of print, and PDF/A requires it on every annotation
+const ANNOT_PRINT = 4
+
+// A tagged annotation's key into the ParentTree, numbered after the pages' own keys
+function putStructParent(ctx: InternalCtx, oid: number, ann: PageAnnot): void {
+  if (ann.structAnnot === undefined || !ctx.structRoot) return
+  const key = ctx.allPageBufs.length + ctx.annotStructs.size
+  ctx.annotStructs.set(ann.structAnnot, { oid, key })
+  ctx.out(`/StructParent ${key}`)
+}
+
 function putCompressedStream(ctx: InternalCtx, data: Uint8Array): void {
-  const comp = deflate(data) as Uint8Array
+  const comp = deflate(data)
   ctx.out('<<')
   ctx.out(`/Length ${ctx.encryptedLength(comp.length)}`)
   ctx.out('/Filter /FlateDecode')
@@ -20,8 +32,7 @@ function putCompressedStream(ctx: InternalCtx, data: Uint8Array): void {
 // overhead, and easier to eyeball in a hex/text dump while this feature
 // was being verified.
 function putAppearanceStream(ctx: InternalCtx, w: number, h: number, body: string): number {
-  const oid = ctx.newObjectDeferred()
-  ctx.newObjectDeferredBegin(oid, true)
+  const oid = ctx.newObject()
   const bytes = _te.encode(body)
   ctx.out('<<')
   ctx.out('/Type /XObject')
@@ -46,16 +57,20 @@ function putFieldWidget(
   ctx: InternalCtx, oid: number, pageObjId: number, ann: PageAnnot,
   apIds: { onId: number; offId?: number | undefined },
 ): void {
-  ctx.newObjectDeferredBegin(oid, true)
+  ctx.newObjectDeferredBegin(oid)
   ctx.out('<<')
   ctx.out('/Type /Annot')
   ctx.out('/Subtype /Widget')
+  ctx.out(`/F ${ANNOT_PRINT}`)
+  putStructParent(ctx, oid, ann)
   ctx.out(`/FT /${ann.fieldType}`)
   ctx.out(`/T ${ctx.strLit(ann.fieldName ?? '')}`)
+  if (ctx.structRoot && ann.tooltip) ctx.out(`/TU ${ctx.strLit(ann.tooltip)}`)
   ctx.out(`/P ${pageObjId} 0 R`)
   ctx.out(`/Rect [${hpf(ann.rect[0])} ${hpf(ann.rect[1])} ${hpf(ann.rect[2])} ${hpf(ann.rect[3])}]`)
   ctx.out('/Border [0 0 0]')
   if (ann.fieldDA) ctx.out(`/DA ${ctx.strLit(ann.fieldDA)}`)
+  if (ann.fieldFlags) ctx.out(`/Ff ${ann.fieldFlags}`)
 
   if (ann.fieldType === 'Btn') {
     ctx.out(`/AP << /N << /On ${apIds.onId} 0 R /Off ${apIds.offId} 0 R >> >>`)
@@ -65,7 +80,10 @@ function putFieldWidget(
     ctx.out(`/AP << /N ${apIds.onId} 0 R >>`)
     ctx.out(`/V ${ctx.strLit(ann.fieldValue ?? '')}`)
     if (ann.fieldType === 'Ch' && ann.fieldOptions) {
-      ctx.out(`/Opt [${ann.fieldOptions.map(o => ctx.strLit(o)).join(' ')}]`)
+      // [export display] pairs when an option's value differs from what it shows
+      const ev = ann.fieldExportValues
+      const opt = ann.fieldOptions.map((o, i) => ev ? `[${ctx.strLit(ev[i] ?? o)} ${ctx.strLit(o)}]` : ctx.strLit(o))
+      ctx.out(`/Opt [${opt.join(' ')}]`)
     }
   }
 
@@ -100,7 +118,7 @@ export function putPages(ctx: InternalCtx): void {
     const annots    = ctx.pageAnnots[n] ?? []
     const annotIds  = annotObjIdsList[n] ?? []
 
-    ctx.newObjectDeferredBegin(pageObjId, true)
+    ctx.newObjectDeferredBegin(pageObjId)
     ctx.out('<</Type /Page')
     ctx.out(`/Parent ${rootId} 0 R`)
     ctx.out(`/Resources ${resId} 0 R`)
@@ -113,11 +131,13 @@ export function putPages(ctx: InternalCtx): void {
     if (ctx.structRoot) ctx.out(`/StructParents ${n}`)
     if (annotIds.length) {
       ctx.out(`/Annots [${annotIds.map(id => `${id} 0 R`).join(' ')}]`)
+      // tagged output: tab through the annotations in structure order
+      if (ctx.structRoot) ctx.out('/Tabs /S')
     }
     ctx.out('>>')
     ctx.out('endobj')
 
-    ctx.newObjectDeferredBegin(contObjId, true)
+    ctx.newObjectDeferredBegin(contObjId)
     putCompressedStream(ctx, _te.encode((ctx.allPageBufs[n] ?? []).join('\n')))
     ctx.out('endobj')
 
@@ -136,10 +156,13 @@ export function putPages(ctx: InternalCtx): void {
         continue
       }
 
-      ctx.newObjectDeferredBegin(oid, true)
+      ctx.newObjectDeferredBegin(oid)
       ctx.out('<<')
       ctx.out('/Type /Annot')
       ctx.out('/Subtype /Link')
+      ctx.out(`/F ${ANNOT_PRINT}`)
+      putStructParent(ctx, oid, ann)
+      if (ctx.structRoot && ann.contents) ctx.out(`/Contents ${ctx.strLit(ann.contents)}`)
       ctx.out(`/Rect [${hpf(ann.rect[0])} ${hpf(ann.rect[1])} ${hpf(ann.rect[2])} ${hpf(ann.rect[3])}]`)
       ctx.out('/Border [0 0 0]')
       if (ann.href !== undefined) {
@@ -155,7 +178,7 @@ export function putPages(ctx: InternalCtx): void {
     }
   }
 
-  ctx.newObjectDeferredBegin(rootId, true)
+  ctx.newObjectDeferredBegin(rootId)
   ctx.out('<</Type /Pages')
   ctx.out(`/Kids [${pageObjIds.map(id => `${id} 0 R`).join(' ')}]`)
   ctx.out(`/Count ${pageCount}`)

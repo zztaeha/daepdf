@@ -1,13 +1,38 @@
-import type { InternalCtx } from './types.js'
-import { hpf, _te } from './utils.js'
+import type { Affine } from '../types/affine.js'
+import type { InternalCtx, GradDef } from './types.js'
+import { hpf, _te, bytesToHex } from './utils.js'
 import { deflate } from './deflate.js'
+import { IDENTITY, composeAffine } from '../types/affine.js'
+
+// An image's own ICC profile, embedded once per distinct profile: without it the pixels
+// would be read as plain sRGB, and a P3 or Adobe RGB photo would print off-color
+function putIccProfile(ctx: InternalCtx, icc: Uint8Array, components: number, written: Map<string, number>): number {
+  const key = `${components}:${bytesToHex(icc)}`
+  const known = written.get(key)
+  if (known !== undefined) return known
+  const oid = ctx.newObject()
+  ctx.out('<<')
+  ctx.out(`/N ${components}`)
+  ctx.out(`/Alternate /${components === 1 ? 'DeviceGray' : components === 4 ? 'DeviceCMYK' : 'DeviceRGB'}`)
+  ctx.out(`/Length ${ctx.encryptedLength(icc.length)}`)
+  ctx.out('>>')
+  ctx.out('stream')
+  ctx.outBytes(icc)
+  ctx.out('endstream')
+  ctx.out('endobj')
+  written.set(key, oid)
+  return oid
+}
 
 export function putImages(ctx: InternalCtx): void {
+  const profiles = new Map<string, number>()
   for (const img of ctx.images) {
+    const components = img.colorSpace === 'DeviceGray' ? 1 : img.colorSpace === 'DeviceCMYK' ? 4 : 3
+    const colorSpace = img.icc ? `[/ICCBased ${putIccProfile(ctx, img.icc, components, profiles)} 0 R]` : `/${img.colorSpace}`
 
     let smaskObjId = 0
     if (img.smask) {
-      const smaskData = deflate(img.smask) as Uint8Array
+      const smaskData = deflate(img.smask)
       smaskObjId = ctx.newObject()
       ctx.out('<<')
       ctx.out('/Type /XObject')
@@ -33,7 +58,7 @@ export function putImages(ctx: InternalCtx): void {
     ctx.out('/Subtype /Image')
     ctx.out(`/Width ${img.width}`)
     ctx.out(`/Height ${img.height}`)
-    ctx.out(`/ColorSpace /${img.colorSpace}`)
+    ctx.out(`/ColorSpace ${colorSpace}`)
     ctx.out('/BitsPerComponent 8')
     ctx.out(`/Filter ${img.filter}`)
     ctx.out(`/Length ${ctx.encryptedLength(img.data.length)}`)
@@ -48,7 +73,7 @@ export function putImages(ctx: InternalCtx): void {
   }
 }
 
-type Stop5 = [number, number, number, number, number]
+export type Stop5 = [number, number, number, number, number]
 type GradGeom = { x: number; y: number; w: number; h: number; pageH: number }
 
 // Stop positions are honored by padding the list to span [0,1] – the 2-stop fast
@@ -62,7 +87,7 @@ const BOUND_MIN_GAP = 1e-6
 const boundFmt = (n: number): string =>
   (Number.isFinite(n) ? n : 0).toFixed(6).replace(/\.?0+$/, '')
 
-function normalizeStops(rawStops: Stop5[]): Stop5[] {
+export function normalizeStops(rawStops: Stop5[]): Stop5[] {
   const sp: Stop5[] = rawStops.map(st => [...st] as Stop5)
   let prev = 0
   for (const st of sp) {
@@ -82,7 +107,7 @@ function normalizeStops(rawStops: Stop5[]): Stop5[] {
   // The ceiling shrinks as the list is walked so each stop leaves room for the
   // ones after it. Clamping every crowded stop to one fixed ceiling was the bug:
   // once a stop reached that value the next was clamped to the same place, or
-  // below a neighbour already sitting at 1, and /Bounds came out decreasing.
+  // below a neighbor already sitting at 1, and /Bounds came out decreasing.
   const last = sp.length - 1
   for (let k = 1; k < last; k++) {
     const cur = sp[k]!, before = sp[k - 1]!
@@ -95,7 +120,7 @@ function normalizeStops(rawStops: Stop5[]): Stop5[] {
 
 // shared by the color shading (DeviceRGB, picks r/g/b) and the alpha soft-mask
 // shading (DeviceGray, picks alpha alone) — same stop list, different component(s)
-function buildFunction(stops: Stop5[], pick: (s: Stop5) => number[]): string {
+export function buildFunction(stops: Stop5[], pick: (s: Stop5) => number[]): string {
   const comps = (s: Stop5) => pick(s).map(hpf).join(' ')
   if (stops.length <= 1) {
     const c = comps(stops[0] ?? [0, 0, 0, 0, 0])
@@ -115,9 +140,12 @@ function buildFunction(stops: Stop5[], pick: (s: Stop5) => number[]): string {
   return `/Function << /FunctionType 3 /Domain [0 1] /Bounds [${bounds}] /Encode [${encode}] /Functions [${funcs}] >>`
 }
 
+type Matrix = Affine
+
 // shared by the color shading and the alpha soft-mask shading — both need
-// identical /ShadingType + /Coords, only the colorspace/function differ
-function shadingCoordLines(def: { gradType: number; angle: number; cx: number; cy: number; fx?: number; fy?: number }, pat: GradGeom): [string, string] {
+// identical /ShadingType + /Coords, only the colorspace/function differ. An ellipse
+// is a unit circle in its own space, mapped onto the box by the returned matrix.
+function shadingGeometry(def: GradDef, pat: GradGeom): { lines: [string, string]; matrix?: Matrix } {
   const cx  = pat.x + pat.w / 2
   const cyp = pat.pageH - pat.y - pat.h / 2
 
@@ -129,13 +157,20 @@ function shadingCoordLines(def: { gradType: number; angle: number; cx: number; c
     const hw = pat.w / 2, hh = pat.h / 2
     const projs = [-hw*dx - hh*dy, hw*dx - hh*dy, -hw*dx + hh*dy, hw*dx + hh*dy]
     const tMin  = Math.min(...projs), tMax = Math.max(...projs)
-    return [
+    return { lines: [
       '/ShadingType 2',
       `/Coords [${hpf(cx+tMin*dx)} ${hpf(cyp+tMin*dy)} ${hpf(cx+tMax*dx)} ${hpf(cyp+tMax*dy)}]`,
-    ]
+    ] }
   }
   const gcx  = pat.x + pat.w * def.cx
   const gcyp = pat.pageH - (pat.y + pat.h * def.cy)
+  if (def.rx !== undefined && def.ry !== undefined) {
+    const rx = Math.max(1e-3, pat.w * def.rx), ry = Math.max(1e-3, pat.h * def.ry)
+    // the focal point in the unit circle's own space
+    const fu = pat.w * (def.fx - def.cx) / rx
+    const fv = -pat.h * (def.fy - def.cy) / ry
+    return { lines: ['/ShadingType 3', `/Coords [${hpf(fu)} ${hpf(fv)} 0 0 0 1]`], matrix: [rx, 0, 0, ry, gcx, gcyp] }
+  }
   // farthest-corner, the CSS default ending-shape size, measured from the real center
   const dxMax = Math.max(gcx - pat.x, pat.x + pat.w - gcx)
   const dyMax = Math.max((pat.pageH - pat.y) - gcyp, gcyp - (pat.pageH - pat.y - pat.h))
@@ -144,13 +179,15 @@ function shadingCoordLines(def: { gradType: number; angle: number; cx: number; c
   // outer circle's own center when fx/fy differ from cx/cy (fx/fy default to
   // cx/cy for CSS radial-gradient and any SVG one that doesn't set them,
   // reproducing the same-center behavior exactly)
-  const gfx  = pat.x + pat.w * (def.fx ?? def.cx)
-  const gfyp = pat.pageH - (pat.y + pat.h * (def.fy ?? def.cy))
-  return [
+  const gfx  = pat.x + pat.w * def.fx
+  const gfyp = pat.pageH - (pat.y + pat.h * def.fy)
+  return { lines: [
     '/ShadingType 3',
     `/Coords [${hpf(gfx)} ${hpf(gfyp)} 0 ${hpf(gcx)} ${hpf(gcyp)} ${hpf(r)}]`,
-  ]
+  ] }
 }
+
+const matrixStr = (m: Matrix) => m.map(hpf).join(' ')
 
 export function putShadingPatterns(ctx: InternalCtx): void {
   if (!ctx.shadPats.length) return
@@ -162,14 +199,15 @@ export function putShadingPatterns(ctx: InternalCtx): void {
     pat.objId = oid
 
     const stops = normalizeStops(def.stops)
+    const geom  = shadingGeometry(def, pat)
 
     ctx.out('<<')
     ctx.out('/PatternType 2')
-    ctx.out('/Matrix [1 0 0 1 0 0]')
+    ctx.out(`/Matrix [${matrixStr(composeAffine(pat.ctm, geom.matrix ?? IDENTITY))}]`)
     ctx.out('/Shading <<')
     ctx.out('/ColorSpace /DeviceRGB')
     ctx.out('/Extend [true true]')
-    for (const line of shadingCoordLines(def, pat)) ctx.out(line)
+    for (const line of geom.lines) ctx.out(line)
     ctx.out(buildFunction(stops, s => [s[1], s[2], s[3]]))
     ctx.out('>>')
     ctx.out('>>')
@@ -188,13 +226,11 @@ export function putGradientSoftMasks(ctx: InternalCtx): void {
     const def = ctx.gradDefs[sm.defIdx]
     if (!def) continue
     const stops = normalizeStops(def.stops)
+    const geom  = shadingGeometry(def, sm)
 
     const shadingOid = ctx.newObject()
     ctx.out('<<')
-    ctx.out('/ShadingType ' + (def.gradType === 0 ? '2' : '3'))
-    // shadingCoordLines' first line duplicates the ShadingType above (needed
-    // for the pattern-embedded case) — only its /Coords line is used here
-    ctx.out(shadingCoordLines(def, sm)[1])
+    for (const line of geom.lines) ctx.out(line)
     ctx.out('/ColorSpace /DeviceGray')
     ctx.out('/Extend [true true]')
     ctx.out(buildFunction(stops, s => [s[4]]))
@@ -203,7 +239,7 @@ export function putGradientSoftMasks(ctx: InternalCtx): void {
 
     const yp = sm.pageH - sm.y - sm.h
     const formOid = ctx.newObject()
-    const formBody = _te.encode(`/ShM${i} sh`)
+    const formBody = _te.encode(geom.matrix ? `q ${matrixStr(geom.matrix)} cm /ShM${i} sh Q` : `/ShM${i} sh`)
     ctx.out('<<')
     ctx.out('/Type /XObject')
     ctx.out('/Subtype /Form')
@@ -230,7 +266,7 @@ export function putGradientSoftMasks(ctx: InternalCtx): void {
 }
 
 export function putResourceDictionary(ctx: InternalCtx): void {
-  ctx.newObjectDeferredBegin(ctx.resourceDictObjId, true)
+  ctx.newObjectDeferredBegin(ctx.resourceDictObjId)
   ctx.out('<<')
   ctx.out('/ProcSet [/PDF /Text /ImageB /ImageC /ImageI]')
 
@@ -247,9 +283,11 @@ export function putResourceDictionary(ctx: InternalCtx): void {
   }
   ctx.out('>>')
 
-  if (ctx.images.length) {
+  const colr = ctx.colrRes
+  if (ctx.images.length || colr.forms.length) {
     ctx.out('/XObject <<')
     for (const img of ctx.images) ctx.out(`/${img.name} ${img.objectNumber} 0 R`)
+    for (const [i, f] of colr.forms.entries()) ctx.out(`/CFm${i} ${f.oid} 0 R`)
     ctx.out('>>')
   }
 
@@ -296,7 +334,7 @@ export function packObjStm(ctx: InternalCtx): void {
 
   const hstr   = hparts.join(' ')
   const body   = `${hstr}\n${bparts.join('\n')}`
-  const comp   = deflate(_te.encode(body)) as Uint8Array
+  const comp   = deflate(_te.encode(body))
   const stmId  = ctx.newObject()
 
   ctx.out('<<')

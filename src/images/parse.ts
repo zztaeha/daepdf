@@ -60,6 +60,14 @@ function exifOrientation(tiff: Uint8Array): number | null {
   return null
 }
 
+// An ICC profile is only usable when its color space has the image's channel count
+// (ISO 15076-1: the data color space signature at byte 16)
+function matchingProfile(icc: Uint8Array | null, colorSpace: string): Uint8Array | null {
+  if (!icc || icc.length < 132) return null
+  const want = colorSpace === 'DeviceGray' ? 'GRAY' : colorSpace === 'DeviceCMYK' ? 'CMYK' : 'RGB '
+  return matchAscii(icc, 16, want) ? icc : null
+}
+
 function parseJpeg(bytes: Uint8Array): ParsedImage | null {
   const dims = parseJpegDims(bytes)
   if (!dims) return null
@@ -67,18 +75,31 @@ function parseJpeg(bytes: Uint8Array): ParsedImage | null {
     width: dims.width, height: dims.height, colorSpace: dims.colorSpace,
     data: bytes, smask: null, isJpeg: true,
     decodeInvert: dims.invert, orientation: dims.orientation,
+    icc: matchingProfile(dims.icc, dims.colorSpace),
   }
 }
 
 function parseJpegDims(bytes: Uint8Array): {
   width: number; height: number
   colorSpace: 'DeviceGray' | 'DeviceRGB' | 'DeviceCMYK'
-  invert: boolean; orientation: number
+  invert: boolean; orientation: number; icc: Uint8Array | null
 } | null {
   if (bytes.length < 4 || bytes[0] !== 0xFF || bytes[1] !== 0xD8) return null
   let i = 2
   let adobe = false
   let orientation = 1
+  // APP2 "ICC_PROFILE": a profile split over numbered segments, joined in order
+  const iccParts = new Map<number, Uint8Array>()
+  let iccCount = 0
+  const icc = (): Uint8Array | null => {
+    if (!iccCount || iccParts.size !== iccCount) return null
+    const parts = Array.from({ length: iccCount }, (_, k) => iccParts.get(k + 1))
+    if (parts.some(p => !p)) return null
+    const out = new Uint8Array(parts.reduce((n, p) => n + p!.length, 0))
+    let off = 0
+    for (const p of parts) { out.set(p!, off); off += p!.length }
+    return out
+  }
   while (i + 3 < bytes.length) {
     if (bytes[i] !== 0xFF) return null
     // 0xFF fill bytes before a marker are legal padding — skip them
@@ -99,12 +120,16 @@ function parseJpegDims(bytes: Uint8Array): {
       const o = exifOrientation(bytes.subarray(i + 8, Math.min(i + segLen, bytes.length)))
       if (o !== null) orientation = o
     }
+    if (marker === 0xE2 && segLen >= 16 && matchAscii(bytes, i + 2, 'ICC_PROFILE\0')) {
+      iccCount = bytes[i + 15]!
+      iccParts.set(bytes[i + 14]!, bytes.subarray(i + 16, Math.min(i + segLen, bytes.length)))
+    }
     if (isSofMarker(marker) && i + 8 < bytes.length) {
       const h = (bytes[i + 3]! << 8) | bytes[i + 4]!
       const w = (bytes[i + 5]! << 8) | bytes[i + 6]!
       const csByte = bytes[i + 7]!
       const colorSpace = csByte === 1 ? 'DeviceGray' : csByte === 4 ? 'DeviceCMYK' : 'DeviceRGB'
-      return { width: w, height: h, colorSpace, invert: adobe && colorSpace === 'DeviceCMYK', orientation }
+      return { width: w, height: h, colorSpace, invert: adobe && colorSpace === 'DeviceCMYK', orientation, icc: icc() }
     }
     if (i + segLen > bytes.length) return null
     i += segLen
@@ -312,5 +337,22 @@ function parsePng(bytes: Uint8Array): ParsedImage | null {
     const tmp = row; row = prev; prev = tmp
   }
 
-  return { width: w, height: h, colorSpace, data: pixels, smask, isJpeg: false, decodeInvert: false, orientation: 1 }
+  return { width: w, height: h, colorSpace, data: pixels, smask, isJpeg: false, decodeInvert: false, orientation: 1, icc: readIccp(bytes, colorSpace) }
+}
+
+// iCCP: a profile name, a NUL, a compression method (0), then the zlib-compressed profile;
+// inflated into a capped buffer, as no real profile comes near it
+function readIccp(b: Uint8Array, colorSpace: string): Uint8Array | null {
+  let icc: Uint8Array | null = null
+  forEachChunk(b, (type, data) => {
+    if (type === 'iCCP') {
+      const nul = data.indexOf(0)
+      if (nul > 0 && nul + 2 <= data.length && data[nul + 1] === 0) {
+        try { icc = unzlib(data.subarray(nul + 2), new Uint8Array(4 * 1024 * 1024)).slice() } catch { icc = null }
+      }
+      return true
+    }
+    return type === 'IDAT' || type === 'IEND'
+  })
+  return matchingProfile(icc, colorSpace)
 }

@@ -1,9 +1,11 @@
-import type { ImageCommand, RawImageCommand, ClipCommand, PathCommand } from '../types/index.js'
-import { PX_PER_PT, domRectToPt, paginateSpan, stackOpacity, type WalkerCtx } from './types.js'
-import { pxToPt, parseBorderRadius, insetBorderRadius, splitByTopLevelComma, splitPositionPair, parseColorAlpha } from './css.js'
+import type { ImageCommand, RawImageCommand, PathCommand } from '../types/index.js'
+import { PX_PER_PT, domRectToPt, paginateSpan, stackOpacity, stackBlend, type WalkerCtx } from './types.js'
+import { pxToPt, parseBorderRadius, insetBorderRadius, splitByTopLevelComma, splitPositionPair, parseColorAlpha, parsePositionComponent, resolveLength } from './css.js'
 import { sniffFormat, pngNeedsBrowserDecode } from '../images/sniff.js'
-import { decodeToRaw, clearDecodeCache, type RawImage } from '../images/decode.js'
+import { decodeToRaw, type RawImage } from '../images/decode.js'
 import { svgToVectorShapes, type VectorShape } from '../pdf/svgvector.js'
+import { templateFontFaces } from './prep.js'
+import { canvasToPngBytes } from './canvaspaint.js'
 
 // D5 (SVG as true vectors): pushes one PathCommand per shape, shifting each
 // shape's own Y coordinates by `dy` — used by the paginateSpan loops below
@@ -23,19 +25,13 @@ function pushVectorShapes(ctx: WalkerCtx, page: number, shapes: VectorShape[], d
       lineCap: shape.lineCap, lineJoin: shape.lineJoin,
       gradient: shape.gradient, gradientBox,
       opacity: opacity !== undefined && shape.opacity !== undefined ? opacity * shape.opacity : (opacity ?? shape.opacity),
+      blend: stackBlend(ctx),
     } as PathCommand)
   }
 }
 
 const _imageCache   = new Map<string, Promise<Uint8Array | null>>()
 const _dataUriCache = new Map<string, Uint8Array | null>()
-
-export function invalidateImageCache(): void {
-  _imageCache.clear()
-  _dataUriCache.clear()
-  _naturalSizeCache.clear()
-  clearDecodeCache()
-}
 
 // A length+prefix+suffix sample was tried first, but real EXIF-orientation
 // test files proved it collides: two JPEGs differing only in a single EXIF
@@ -74,7 +70,7 @@ type ResolvedImage =
   | { kind: 'raw'; raw: RawImage }
 
 async function resolveImage(srcUrl: string): Promise<ResolvedImage | null> {
-  let src: Uint8Array | null = null
+  let src: Uint8Array | null
   let format: ImageFormat = 'png'
 
   if (srcUrl.startsWith('data:')) {
@@ -114,6 +110,7 @@ async function resolveImage(srcUrl: string): Promise<ResolvedImage | null> {
   // entirely, valid bytes or not — not decoded by anything.
   if (format !== 'svg') {
     const f = sniffFormat(src)
+    if (f === 'svg') return { kind: 'bytes', src, format: 'svg' }
     const wasmHandles = f === 'jpeg' || (f === 'png' && !pngNeedsBrowserDecode(src))
     if (!wasmHandles) {
       if (f !== 'png' && f !== 'webp' && f !== 'avif') return null
@@ -128,22 +125,6 @@ async function resolveImage(srcUrl: string): Promise<ResolvedImage | null> {
 export function extractBgUrl(layer: string): string | null {
   const m = layer.match(/^url\(["']?([^"')]+)["']?\)$/)
   return m ? m[1] ?? null : null
-}
-
-function parsePositionComponent(val: string | undefined, availableSpace: number): number {
-  if (!val) return availableSpace / 2
-  const pctM = val.match(/^(-?[\d.]+)%$/)
-  if (pctM) return availableSpace * (+pctM[1]! / 100)
-  const pxM = val.match(/^(-?[\d.]+)px$/)
-  if (pxM) return +pxM[1]! / PX_PER_PT
-  // 4-value syntax ("right 10px top") computes to calc(100% - 10px)
-  const calcM = val.match(/^calc\((-?[\d.]+)%\s*([+-])\s*(-?[\d.]+)px\)$/)
-  if (calcM) {
-    const base = availableSpace * (+calcM[1]! / 100)
-    const off  = +calcM[3]! / PX_PER_PT
-    return calcM[2] === '+' ? base + off : base - off
-  }
-  return availableSpace / 2
 }
 
 interface ObjectFitRect { x: number; y: number; w: number; h: number; needsClip: boolean }
@@ -215,6 +196,7 @@ export async function emitImage(el: HTMLImageElement, ctx: WalkerCtx): Promise<v
   const needsClip  = fit.needsClip || !!clipRadius
 
   const opacity = stackOpacity(ctx)
+  const blend   = stackBlend(ctx)
 
   // D5: an <img src="*.svg"> attempts true-vector conversion first, same
   // fallback contract as emitInlineSVG — a file with an unsupported feature
@@ -231,15 +213,15 @@ export async function emitImage(el: HTMLImageElement, ctx: WalkerCtx): Promise<v
   for (const { page, y: boxLy } of paginateSpan(cbY, cbH, ctx.pageH)) {
     const pageOffset = cbY - boxLy
     const imgLy = fit.y - pageOffset
-    if (needsClip) ctx.commands.push({ type: 'clip-push', page, x: cbX, y: boxLy, w: cbW, h: cbH, radius: clipRadius } as ClipCommand)
+    if (needsClip) ctx.commands.push({ type: 'clip-push', page, x: cbX, y: boxLy, w: cbW, h: cbH, radius: clipRadius })
     if (vectorShapes) {
       pushVectorShapes(ctx, page, vectorShapes, imgLy - fit.y, opacity)
     } else {
       ctx.commands.push(img.kind === 'raw'
-        ? { type: 'raw-image', page, raw: img.raw, x: fit.x, y: imgLy, w: fit.w, h: fit.h, opacity } as RawImageCommand
-        : { type: 'image', page, src: img.src, format: img.format, x: fit.x, y: imgLy, w: fit.w, h: fit.h, opacity } as ImageCommand)
+        ? { type: 'raw-image', page, raw: img.raw, x: fit.x, y: imgLy, w: fit.w, h: fit.h, opacity, blend } as RawImageCommand
+        : { type: 'image', page, src: img.src, format: img.format, x: fit.x, y: imgLy, w: fit.w, h: fit.h, opacity, blend } as ImageCommand)
     }
-    if (needsClip) ctx.commands.push({ type: 'clip-pop', page } as ClipCommand)
+    if (needsClip) ctx.commands.push({ type: 'clip-pop', page })
   }
 }
 
@@ -250,13 +232,8 @@ export function emitCanvas(el: HTMLCanvasElement, ctx: WalkerCtx): void {
   if (domRect.width < 1 || domRect.height < 1) return
   if (!el.width || !el.height) return
 
-  let dataUrl: string
-  try { dataUrl = el.toDataURL('image/png') } catch { return /* tainted canvas */ }
-  const comma = dataUrl.indexOf(',')
-  if (comma < 0) return
-  const bin = atob(dataUrl.slice(comma + 1))
-  const src = new Uint8Array(bin.length)
-  for (let i = 0; i < bin.length; i++) src[i] = bin.charCodeAt(i)
+  const src = canvasToPngBytes(el)
+  if (!src) return
 
   const { x, y, w, h } = domRectToPt(domRect, ctx.containerRect)
   const cs   = getComputedStyle(el)
@@ -272,13 +249,83 @@ export function emitCanvas(el: HTMLCanvasElement, ctx: WalkerCtx): void {
   const clipRadius = insetBorderRadius(parseBorderRadius(cs, el), insT, insR, insB, insL)
   const opacity = stackOpacity(ctx)
   for (const { page, y: ly } of paginateSpan(cbY, cbH, ctx.pageH)) {
-    if (clipRadius) ctx.commands.push({ type: 'clip-push', page, x: cbX, y: ly, w: cbW, h: cbH, radius: clipRadius } as ClipCommand)
+    if (clipRadius) ctx.commands.push({ type: 'clip-push', page, x: cbX, y: ly, w: cbW, h: cbH, radius: clipRadius })
     ctx.commands.push({
       type: 'image', page, src, format: 'png',
       x: cbX, y: ly, w: cbW, h: cbH,
-      opacity,
+      opacity, blend: stackBlend(ctx),
     } as ImageCommand)
-    if (clipRadius) ctx.commands.push({ type: 'clip-pop', page } as ClipCommand)
+    if (clipRadius) ctx.commands.push({ type: 'clip-pop', page })
+  }
+}
+
+const PAINT_PROPS = [
+  'fill', 'fill-opacity', 'fill-rule', 'stroke', 'stroke-width', 'stroke-opacity',
+  'stroke-dasharray', 'stroke-linecap', 'stroke-linejoin', 'opacity', 'visibility', 'display',
+  'font-family', 'font-size', 'font-weight', 'font-style', 'letter-spacing',
+]
+
+const _fontDataUrls = new Map<string, Promise<string | null>>()
+
+function fontDataUrl(url: string): Promise<string | null> {
+  let hit = _fontDataUrls.get(url)
+  if (!hit) {
+    hit = fetch(url).then(r => r.ok ? r.arrayBuffer() : null).then(buf => {
+      if (!buf) return null
+      const bytes = new Uint8Array(buf)
+      let bin = ''
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+      return `data:application/octet-stream;base64,${btoa(bin)}`
+    }).catch(() => null)
+    _fontDataUrls.set(url, hit)
+  }
+  return hit
+}
+
+// @font-face rules for the template fonts an SVG's text uses, their files inlined: an SVG
+// drawn as an image loads nothing, so its text would otherwise fall back to the default font
+async function svgFontFaces(svg: SVGSVGElement): Promise<string> {
+  const families = new Set<string>()
+  for (const t of Array.from(svg.querySelectorAll('text, tspan, textPath'))) {
+    for (const f of getComputedStyle(t).fontFamily.split(',')) families.add(f.trim().replace(/^["']|["']$/g, ''))
+  }
+  const blocks = [...families].flatMap(templateFontFaces)
+  const inlined = await Promise.all(blocks.map(async block => {
+    let out = block
+    for (const m of block.matchAll(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g)) {
+      const data = await fontDataUrl(m[2]!)
+      if (data) out = out.replace(m[0], `url(${data})`)
+    }
+    return out
+  }))
+  return inlined.join('\n')
+}
+
+// Serializing drops stylesheet rules, so computed paint is written back as attributes. Inside
+// <defs>/<symbol> only stop colors are: a <use> instance inherits from the <use> instead.
+function bakeComputedPaint(live: Element, clone: Element): void {
+  if (live.tagName === 'defs' || live.tagName === 'symbol') {
+    const stops = live.querySelectorAll('stop'), cloneStops = clone.querySelectorAll('stop')
+    stops.forEach((stop, i) => {
+      const cs = getComputedStyle(stop), target = cloneStops[i]
+      target?.setAttribute('stop-color', cs.getPropertyValue('stop-color'))
+      target?.setAttribute('stop-opacity', cs.getPropertyValue('stop-opacity'))
+      ;(target as SVGElement | undefined)?.style.removeProperty('stop-color')
+      ;(target as SVGElement | undefined)?.style.removeProperty('stop-opacity')
+    })
+    return
+  }
+  const cs = getComputedStyle(live)
+  for (const prop of PAINT_PROPS) {
+    const v = cs.getPropertyValue(prop)
+    // a gradient reference keeps its authored form, which the vector path resolves itself
+    if (!v || ((prop === 'fill' || prop === 'stroke') && v.startsWith('url('))) continue
+    clone.setAttribute(prop, v)
+    ;(clone as SVGElement).style.removeProperty(prop)
+  }
+  for (let i = 0; i < live.children.length; i++) {
+    const c = clone.children[i]
+    if (c) bakeComputedPaint(live.children[i]!, c)
   }
 }
 
@@ -294,11 +341,20 @@ export async function emitInlineSVG(el: SVGSVGElement, ctx: WalkerCtx): Promise<
   // attribute-less SVGs rendering at their laid-out size instead of the 300x150 default
   const cs    = getComputedStyle(el)
   const clone = el.cloneNode(true) as SVGSVGElement
+  bakeComputedPaint(el, clone)
+  // the svg's own opacity is already on the walker's opacity stack
+  clone.removeAttribute('opacity')
   clone.style.color      = cs.color
   clone.style.fontFamily = cs.fontFamily
   clone.style.fontSize   = cs.fontSize
   clone.setAttribute('width',  String(domRect.width))
   clone.setAttribute('height', String(domRect.height))
+  const faces = await svgFontFaces(el)
+  if (faces) {
+    const style = clone.ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'style')
+    style.textContent = faces
+    clone.insertBefore(style, clone.firstChild)
+  }
   const svgStr = new XMLSerializer().serializeToString(clone)
   const opacity = stackOpacity(ctx)
 
@@ -319,7 +375,7 @@ export async function emitInlineSVG(el: SVGSVGElement, ctx: WalkerCtx): Promise<
     ctx.commands.push({
       type: 'image', page, src, format: 'svg',
       x, y: ly, w, h,
-      opacity,
+      opacity, blend: stackBlend(ctx),
     } as ImageCommand)
   }
 }
@@ -351,16 +407,10 @@ function parseBgSize(
     return { tileW: naturalW * scale, tileH: naturalH * scale }
   }
 
-  const parseComponent = (v: string | undefined, ref: number): number | null => {
-    if (!v || v === 'auto') return null
-    const pctM = v.match(/^(-?[\d.]+)%$/)
-    if (pctM) return ref * (+pctM[1]! / 100)
-    const pxM = v.match(/^(-?[\d.]+)px$/)
-    if (pxM) return +pxM[1]! / PX_PER_PT
-    return null
-  }
+  const parseComponent = (v: string | undefined, ref: number): number | null =>
+    !v || v === 'auto' ? null : resolveLength(v, ref)
 
-  const [wRaw, hRaw] = val.split(/\s+/)
+  const [wRaw, hRaw] = splitPositionPair(val)
   let tw = parseComponent(wRaw, boxW)
   let th = parseComponent(hRaw, boxH)
 
@@ -371,36 +421,90 @@ function parseBgSize(
   return { tileW: tw ?? boxW, tileH: th ?? boxH }
 }
 
-function parseBgRepeat(repeatStr: string): { repeatX: boolean; repeatY: boolean } {
-  const parts = (repeatStr || 'repeat').trim().split(/\s+/)
-  let rx: string, ry: string
-  if (parts.length === 1) {
-    const v = parts[0] ?? ''
-    if      (v === 'repeat-x') { rx = 'repeat';    ry = 'no-repeat' }
-    else if (v === 'repeat-y') { rx = 'no-repeat'; ry = 'repeat'    }
-    else                       { rx = v;           ry = v           }
-  } else {
-    rx = parts[0] ?? ''; ry = parts[1] ?? ''
+type RepeatMode = 'repeat' | 'no-repeat' | 'round' | 'space'
+
+function parseBgRepeat(repeatStr: string): { x: RepeatMode; y: RepeatMode } {
+  const parts = (repeatStr || 'repeat').trim().split(/\s+/) as RepeatMode[]
+  const v = parts[0] as string
+  if (parts.length > 1) return { x: parts[0]!, y: parts[1]! }
+  if (v === 'repeat-x') return { x: 'repeat', y: 'no-repeat' }
+  if (v === 'repeat-y') return { x: 'no-repeat', y: 'repeat' }
+  return { x: parts[0]!, y: parts[0]! }
+}
+
+// One axis of a background's tiling (CSS Backgrounds 3): round fits a whole number of tiles
+// into the origin box; space spreads whole ones edge to edge, or doesn't repeat if under two fit.
+function tileAxis(mode: RepeatMode, tile: number, start: number, len: number, pos: string | undefined): { size: number; step: number; ref: number; repeat: boolean } {
+  if (mode === 'space' && tile > 0.01) {
+    const count = Math.floor(len / tile)
+    if (count >= 2) return { size: tile, step: tile + (len - count * tile) / (count - 1), ref: start, repeat: true }
+    mode = 'no-repeat'
   }
-  return { repeatX: rx !== 'no-repeat', repeatY: ry !== 'no-repeat' }
+  const size = mode === 'round' && tile > 0.01 ? len / Math.max(1, Math.round(len / tile)) : tile
+  return { size, step: size, ref: start + parsePositionComponent(pos, len - size), repeat: mode !== 'no-repeat' }
+}
+
+// Both axes of a background (or mask) laid over `origin`: size, repeat and position resolved
+export function tileAxes(
+  sizeStr: string, repeatStr: string, positionStr: string,
+  origin: { x: number; y: number; w: number; h: number }, naturalW: number, naturalH: number,
+): { ax: ReturnType<typeof tileAxis>; ay: ReturnType<typeof tileAxis> } {
+  const sized = parseBgSize(sizeStr, origin.w, origin.h, naturalW, naturalH)
+  const modes = parseBgRepeat(repeatStr)
+  const [posX, posY] = splitPositionPair(positionStr)
+  const ax = tileAxis(modes.x, sized.tileW, origin.x, origin.w, posX)
+  const ay = tileAxis(modes.y, sized.tileH, origin.y, origin.h, posY)
+  // round on one axis with an auto size on the other keeps the image's aspect ratio
+  const [sizeW = 'auto', sizeH = 'auto'] = /cover|contain/.test(sizeStr) ? [] : splitPositionPair(sizeStr)
+  if (modes.x === 'round' && modes.y !== 'round' && sizeH === 'auto' && sized.tileW > 0.01) {
+    ay.size = ay.step = sized.tileH * ax.size / sized.tileW
+    ay.ref = origin.y + parsePositionComponent(posY, origin.h - ay.size)
+  } else if (modes.y === 'round' && modes.x !== 'round' && sizeW === 'auto' && sized.tileH > 0.01) {
+    ax.size = ax.step = sized.tileW * ay.size / sized.tileH
+    ax.ref = origin.x + parsePositionComponent(posX, origin.w - ax.size)
+  }
+  return { ax, ay }
 }
 
 const MAX_BG_TILES = 500
 
-export async function emitBgImage(
-  el: Element, srcUrl: string, ctx: WalkerCtx, layerIndex = 0, layerCount = 1,
-): Promise<void> {
+// Where one axis's tiles start, covering [from, to): just the anchor when it doesn't repeat
+export function tilePositions(a: ReturnType<typeof tileAxis>, from: number, to: number): number[] {
+  if (a.size <= 0.01 || !a.repeat) return [a.ref]
+  const out: number[] = []
+  for (let t = a.ref - Math.ceil((a.ref - from) / a.step) * a.step; t < to && out.length < MAX_BG_TILES; t += a.step) out.push(t)
+  return out
+}
+
+export interface BgImage { img: ResolvedImage; natural: { w: number; h: number } | null }
+
+// Fetched up front, by layer index, so emitBox can paint each url() layer in its own slot:
+// above the background color and the layers below it, under the border.
+export async function resolveBgImages(s: CSSStyleDeclaration): Promise<Map<number, BgImage> | undefined> {
+  if (!s.backgroundImage || s.backgroundImage === 'none') return undefined
+  const out = new Map<number, BgImage>()
+  await Promise.all(splitByTopLevelComma(s.backgroundImage).map(async (layer, i) => {
+    const url = extractBgUrl(layer.trim())
+    if (!url) return
+    const img = await resolveImage(url)
+    if (!img) { console.warn(`[daepdf] Could not resolve background-image: ${url}`); return }
+    const natural = img.kind === 'raw'
+      ? { w: img.raw.width, h: img.raw.height }
+      : img.format === 'svg' ? null : await getNaturalSize(img.src)
+    out.set(i, { img, natural })
+  }))
+  return out.size ? out : undefined
+}
+
+// onlyPage: emitBox paints a box page by page, so each page gets its own slice in order
+export function emitBgImage(
+  el: Element, bg: BgImage, ctx: WalkerCtx, layerIndex: number, layerCount: number, onlyPage: number,
+): void {
   const domRect = el.getBoundingClientRect()
   if (domRect.width < 1 || domRect.height < 1) return
 
   const { x, y, w, h } = domRectToPt(domRect, ctx.containerRect)
-
-  const img = await resolveImage(srcUrl)
-  // background-image previously failed completely silently here (unlike <img>,
-  // which has always warned) — a resolveImage failure (bad fetch, unsupported
-  // format, browser decode rejection) left the background just... blank, with
-  // nothing in the console to say why
-  if (!img) { console.warn(`[daepdf] Could not resolve background-image: ${srcUrl}`); return }
+  const { img, natural } = bg
 
   const cs = getComputedStyle(el)
   const pick = (list: string[], fallback: string) =>
@@ -440,38 +544,18 @@ export async function emitBgImage(
   const clip   = boxFor(clipStr)
   if (clip.w <= 0 || clip.h <= 0) return
 
-  const natural = img.kind === 'raw'
-    ? { w: img.raw.width, h: img.raw.height }
-    : img.format === 'svg' ? null : await getNaturalSize(img.src)
   const naturalW = (natural?.w ?? 0) / PX_PER_PT
   const naturalH = (natural?.h ?? 0) / PX_PER_PT
 
-  const { tileW, tileH } = parseBgSize(sizeStr, origin.w, origin.h, naturalW, naturalH)
-  const { repeatX, repeatY } = parseBgRepeat(repeatStr)
-
-  const [posXRaw, posYRaw] = splitPositionPair(positionStr)
-  const refX = origin.x + parsePositionComponent(posXRaw, origin.w - tileW)
-  const refY = origin.y + parsePositionComponent(posYRaw, origin.h - tileH)
+  const { ax, ay } = tileAxes(sizeStr, repeatStr, positionStr, origin, naturalW, naturalH)
+  const tileW = ax.size, tileH = ay.size
 
   // repeat coverage: the element's clip box for scroll, the whole page for fixed
   const coverX0 = fixed ? 0 : clip.x, coverX1 = fixed ? ctx.pageW : clip.x + clip.w
   const coverY0 = fixed ? 0 : clip.y, coverY1 = fixed ? ctx.pageH : clip.y + clip.h
 
-  const tileXs: number[] = []
-  if (tileW > 0.01 && repeatX) {
-    const first = refX - Math.ceil((refX - coverX0) / tileW) * tileW
-    for (let tx = first; tx < coverX1 && tileXs.length < MAX_BG_TILES; tx += tileW) tileXs.push(tx)
-  } else {
-    tileXs.push(refX)
-  }
-
-  const tileYs: number[] = []
-  if (tileH > 0.01 && repeatY) {
-    const first = refY - Math.ceil((refY - coverY0) / tileH) * tileH
-    for (let ty = first; ty < coverY1 && tileYs.length < MAX_BG_TILES; ty += tileH) tileYs.push(ty)
-  } else {
-    tileYs.push(refY)
-  }
+  const tileXs = tilePositions(ax, coverX0, coverX1)
+  const tileYs = tilePositions(ay, coverY0, coverY1)
 
   // MAX_BG_TILES bounds each axis independently, but the draw loop below is
   // the full cartesian product of tileXs × tileYs — a background tiny on
@@ -499,25 +583,27 @@ export async function emitBgImage(
   )
 
   const opacity = stackOpacity(ctx)
-  const needsClip = repeatX || repeatY || tileW !== clip.w || tileH !== clip.h || !!clipRadius
+  const blend   = stackBlend(ctx)
+  const needsClip = ax.repeat || ay.repeat || tileW !== clip.w || tileH !== clip.h || !!clipRadius
 
   for (const { page, y: boxLy } of paginateSpan(clip.y, clip.h, ctx.pageH)) {
+    if (page !== onlyPage) continue
     // fixed: tileYs were built page-local (against [0, pageH]) — the SAME set
     // draws identically on every page, no per-page offset to reconcile.
     // scroll: tileYs are global, so pageOffset re-bases each tile to this
     // page's own local frame (boxLy is where global clip.y lands here).
     const pageOffset = fixed ? 0 : clip.y - boxLy
     const yLo = fixed ? boxLy : clip.y, yHi = fixed ? boxLy + clip.h : clip.y + clip.h
-    if (needsClip) ctx.commands.push({ type: 'clip-push', page, x: clip.x, y: boxLy, w: clip.w, h: clip.h, radius: clipRadius } as ClipCommand)
+    if (needsClip) ctx.commands.push({ type: 'clip-push', page, x: clip.x, y: boxLy, w: clip.w, h: clip.h, radius: clipRadius })
     for (const tx of tileXs) {
       if (tx + tileW < clip.x || tx > clip.x + clip.w) continue
       for (const ty of tileYs) {
         if (ty + tileH < yLo || ty > yHi) continue
         ctx.commands.push(img.kind === 'raw'
-          ? { type: 'raw-image', page, raw: img.raw, x: tx, y: ty - pageOffset, w: tileW, h: tileH, opacity } as RawImageCommand
-          : { type: 'image', page, src: img.src, format: img.format, x: tx, y: ty - pageOffset, w: tileW, h: tileH, opacity } as ImageCommand)
+          ? { type: 'raw-image', page, raw: img.raw, x: tx, y: ty - pageOffset, w: tileW, h: tileH, opacity, blend } as RawImageCommand
+          : { type: 'image', page, src: img.src, format: img.format, x: tx, y: ty - pageOffset, w: tileW, h: tileH, opacity, blend } as ImageCommand)
       }
     }
-    if (needsClip) ctx.commands.push({ type: 'clip-pop', page } as ClipCommand)
+    if (needsClip) ctx.commands.push({ type: 'clip-pop', page })
   }
 }

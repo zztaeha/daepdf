@@ -23,6 +23,9 @@ export function applyBookmarks(doc: PdfDoc, bookmarks: BookmarkEntry[]): void {
   for (const bm of bookmarks) doc.add_bookmark(bm.title, bm.page, bm.y ?? 0, safeLevel(bm.level))
 }
 
+const randomPassword = (): string =>
+  Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('')
+
 export function applySecurity(doc: PdfDoc, sec: PDFSecurity): void {
   const p = sec.permissions
   // all bits 1 except bits 1-2 (always reserved/0) — the P field's bit
@@ -34,7 +37,8 @@ export function applySecurity(doc: PdfDoc, sec: PDFSecurity): void {
   if (p?.copy      === false) perm &= ~0x10
   if (p?.annotate  === false) perm &= ~0x20
   if (p?.fillForms === false) perm &= ~0x100
-  doc.set_security(sec.userPassword ?? '', sec.ownerPassword ?? '', perm >>> 0)
+  // an empty owner password opens the file with full rights, which undoes every restriction
+  doc.set_security(sec.userPassword ?? '', sec.ownerPassword ?? randomPassword(), perm >>> 0)
 }
 
 export function applyStructTree(doc: PdfDoc, structRoot: StructNode): void {
@@ -50,12 +54,16 @@ export function applyPdfA(doc: PdfDoc, metadata: PDFMetadata | undefined): void 
   doc.set_pdfa(metadata?.language)
 }
 
+// PDF/UA-1: identification and DisplayDocTitle; the structure itself is taggedPdf's
+export function applyPdfUA(doc: PdfDoc, metadata: PDFMetadata | undefined): void {
+  doc.set_pdfua(metadata?.language)
+}
+
 export function resolveSecurityConfig(security: PDFSecurity | null | undefined): PDFSecurity | null {
   if (security === undefined) {
     return {
       userPassword:  '',
-      ownerPassword: Array.from(crypto.getRandomValues(new Uint8Array(16)))
-        .map(b => b.toString(16).padStart(2, '0')).join(''),
+      ownerPassword: randomPassword(),
       permissions: { print: true, copy: true, modify: false, annotate: false, fillForms: false },
     }
   }

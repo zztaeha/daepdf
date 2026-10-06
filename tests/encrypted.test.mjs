@@ -26,7 +26,7 @@ export default async function ({ test, ok, load }) {
     d.set_security('', 'owner-pw', -3904)
     d.set_font('Inter', 'normal', 400); d.set_font_size(12)
     d.text('Encrypted content here', 20, 100, 'alphabetic')
-    d.set_fill_color(1, 2, 3); d.rect(10, 10, 50, 50, 'F')
+    d.set_fill_color(1, 2, 3); d.rect(10, 10, 50, 50)
     d.set_metadata('Title', 'Secret')
     const buf = Buffer.from(d.output())
     const s = buf.toString('latin1')
@@ -46,7 +46,7 @@ export default async function ({ test, ok, load }) {
   test('an encrypted document declares the right handler', () => {
     const d = new PdfDoc(200, 200)
     d.set_security('', 'pw', -3904)
-    d.rect(0, 0, 10, 10, 'F')
+    d.rect(0, 0, 10, 10)
     const s = Buffer.from(d.output()).toString('latin1')
     ok(s.includes('/Filter /Standard'), 'standard security handler')
     ok(/\/V 5/.test(s) && /\/R 6/.test(s), 'V5/R6')

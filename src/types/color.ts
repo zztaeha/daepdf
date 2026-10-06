@@ -34,20 +34,26 @@ export interface GradientStop {
   posPx?:   number
 }
 
+// straightAlpha: stops interpolate unpremultiplied, as browsers paint SVG gradients; CSS
+// gradients interpolate premultiplied, so a fade to transparent keeps its hue
 export type Gradient =
-  | { type: 'linear'; angle: number; corner?: string | undefined; repeating?: boolean | undefined; stops: GradientStop[] }
+  | { type: 'linear'; angle: number; corner?: string | undefined; repeating?: boolean | undefined; straightAlpha?: boolean | undefined; stops: GradientStop[] }
   // fx/fy: SVG-only focal point (a true, 0-radius inner circle per SVG's two-circle
   // radial model) — absent for CSS radial-gradient, which has no focal-point concept
   // and always uses cx/cy for both circles; when absent here too, downstream falls
   // back to cx/cy, reproducing that same same-center behavior unchanged
-  | { type: 'radial'; cx?: number; cy?: number; fx?: number; fy?: number; radius?: number; repeating?: boolean | undefined; stops: GradientStop[] }
+  // rx/ry: the ending shape's radii as fractions of the painted box's width/height. A
+  // CSS gradient carries its raw size/position tokens until the box is known (resolveGradientBox)
+  | { type: 'radial'; cx?: number; cy?: number; fx?: number; fy?: number; rx?: number; ry?: number
+      circle?: boolean | undefined; size?: string[] | undefined; position?: [string, string] | undefined
+      repeating?: boolean | undefined; straightAlpha?: boolean | undefined; stops: GradientStop[] }
 
 // conic gradients can't be expressed as PDF axial/radial shadings — they are
 // rasterized through a canvas instead, so they live outside the Gradient union
 export interface ConicGradient {
   fromDeg:    number
-  cx:         number
-  cy:         number
+  // computed-style center ("50% 50%", "10px 20%"), resolved against the painted box
+  position?:  [string, string] | undefined
   repeating?: boolean | undefined
   stops:      GradientStop[]
 }

@@ -1,3 +1,4 @@
+import type { Affine } from './affine.js'
 import type { Color, Gradient, BorderRadius, Corner, BoxShadow } from './color.js'
 import type { RawImage } from '../images/decode.js'
 
@@ -12,12 +13,13 @@ export interface TextCommand {
   weight:         number
   size:           number
   color:          Color
-  align:          'left' | 'center' | 'right'
   maxWidth:       number
   opacity?:       number
   letterSpacing?: number
   wordSpacing?:   number
   direction?:     'ltr' | 'rtl'
+  // tan of a synthetic oblique angle: italic asked for, but the font has no italic face
+  skew?:          number
   // -webkit-text-stroke — PDF text render mode 2 (fill+stroke) or 1 (stroke only,
   // when the fill color is transparent)
   stroke?:        Color
@@ -36,6 +38,9 @@ export interface TextCommand {
   structTag?:     string
 }
 
+// the URL schemes a link annotation may carry; a #fragment is an internal jump instead
+export const LINK_SCHEMES = /^(https?|mailto|tel):/i
+
 export interface LinkCommand {
   type:   'link'
   page:   number
@@ -44,6 +49,10 @@ export interface LinkCommand {
   w:      number
   h:      number
   href:   string
+  // D3 (tagged PDF): the AnnotRef key placing this annotation in its structure element
+  structAnnot?: number
+  // the link's accessible description (/Contents), written for tagged output
+  contents?:    string
 }
 
 export interface RectCommand {
@@ -134,13 +143,14 @@ export interface RawImageCommand {
   structTag?: string
 }
 
-// CSS transforms: matrix is the PDF-native `cm` 6-tuple [a,b,c,d,e,f],
-// already adapted for Y-up and pivoted around transform-origin — see
-// html/transform.ts's buildPdfTransformMatrix for the derivation
+// matrix: a PDF-native cm. css + origin: a CSS transform (e, f in pt) and its origin (pt, y
+// down), made into a cm by the writer, which knows the page height content flips against.
 export interface TransformCommand {
   type:    'transform-push' | 'transform-pop'
   page:    number
   matrix?: number[]
+  css?:    Affine
+  origin?: [number, number]
 }
 
 // D1 (AcroForm): one interactive form control. A merged field+widget (one
@@ -165,7 +175,12 @@ export interface FieldCommand {
   color:     Color
   value?:    string   // Tx: typed text. Ch: the selected <option>'s value/text
   checked?:  boolean  // Btn: checkbox/radio state (radio groups are NOT modeled — each is an independent Btn field, a stated scope limit)
-  options?:  string[] // Ch: the <option> list, in DOM order
+  options?:  string[] // Ch: the <option> list as displayed, in DOM order
+  exportValues?: string[] // Ch: each option's value, when any differs from its text
+  flags?:    number   // /Ff bits: multiline, password, combo, multi-select
+  display?:  string   // drawn instead of value: a password's bullets, a select's option text
+  structAnnot?: number // D3 (tagged PDF) – see LinkCommand.structAnnot
+  tooltip?:  string   // the control's accessible name (/TU), written for tagged output
 }
 
 // D5 (SVG as true vectors): a single filled/stroked shape, already resolved
@@ -187,6 +202,16 @@ export interface PathCommand {
   gradientBox?: { x: number; y: number; w: number; h: number }
   opacity?:     number
   blend?:       string
+  // D3 (tagged PDF) – see TextCommand.mcid/structTag
+  mcid?:        number
+  structTag?:   string
+}
+
+// Tagged PDF: a header or footer group is one pagination artifact, outside the reading order
+export interface ArtifactCommand {
+  type:     'artifact-push' | 'artifact-pop'
+  page:     number
+  subtype?: 'Header' | 'Footer'
 }
 
 export type DrawCommand =
@@ -200,6 +225,7 @@ export type DrawCommand =
   | TransformCommand
   | FieldCommand
   | PathCommand
+  | ArtifactCommand
 
 export interface ResolvedRadius { tl: Corner; tr: Corner; br: Corner; bl: Corner }
 

@@ -1,40 +1,17 @@
-import { domRectToPt, paginateSpan, stackOpacity, type WalkerCtx } from './types.js'
-import { paintNode, canvasToPngBytes } from './canvaspaint.js'
-import { parseCSSGradient, parseCSSConicGradient, tileStops } from './css.js'
-import { resolveGradientBox } from './emit.js'
+import { PX_PER_PT, domRectToPt, paginateSpan, stackOpacity, stackBlend, type WalkerCtx } from './types.js'
+import { paintNode, canvasToPngBytes, fillGradient, fillConic, loadImage } from './canvaspaint.js'
+import { parseCSSGradient, parseCSSConicGradient, resolveGradientBox } from './css.js'
+import { tileAxes, tilePositions } from './images.js'
 import type { ImageCommand } from '../types/index.js'
-import type { GradientStop } from '../types/index.js'
 
 export function hasMask(s: CSSStyleDeclaration): boolean {
   const v = (s as any).maskImage as string | undefined
   return !!v && v !== 'none'
 }
 
-function addStops(grad: CanvasGradient, stops: GradientStop[]): void {
-  for (const st of stops) {
-    const [r, g, b, a] = st.color
-    grad.addColorStop(Math.min(1, Math.max(0, st.position)), `rgba(${r},${g},${b},${a / 255})`)
-  }
-}
-
-function loadImage(url: string): Promise<HTMLImageElement | null> {
-  return new Promise(resolve => {
-    const img = new Image()
-    img.onload  = () => resolve(img)
-    img.onerror = () => resolve(null)
-    img.src = url
-  })
-}
-
-// Paints the mask-image source onto a canvas at the element's own pixel
-// size. Gradients resolve with the exact math the background-gradient path
-// uses (resolveGradientBox), so a mask gradient behaves identically to the
-// same gradient used as a background — canvas is Y-down like CSS/DOM, unlike
-// the PDF shading path, so the linear-gradient direction vector here is
-// (sin, -cos), not putShadingPatterns' PDF-Y-up (sin, cos). url() sources
-// load as an <img> and draw directly, the same same-origin/data-URI
-// assumption this renderer's existing background-image handling makes.
-async function paintMaskSource(spec: string, wPt: number, hPt: number, cw: number, ch: number): Promise<HTMLCanvasElement | null> {
+// The mask-image source at the element's pixel size: a gradient as backgrounds paint it, or a
+// url() image (same-origin, data or CORS) sized and tiled like a background over the border box
+async function paintMaskSource(spec: string, s: CSSStyleDeclaration, wPt: number, hPt: number, cw: number, ch: number): Promise<HTMLCanvasElement | null> {
   const canvas = document.createElement('canvas')
   canvas.width  = cw
   canvas.height = ch
@@ -42,33 +19,13 @@ async function paintMaskSource(spec: string, wPt: number, hPt: number, cw: numbe
 
   const lin = parseCSSGradient(spec)
   if (lin) {
-    const g = resolveGradientBox(lin, wPt, hPt)
-    let grad: CanvasGradient
-    if (g.type === 'linear') {
-      const rad = g.angle * Math.PI / 180
-      const dx = Math.sin(rad), dy = -Math.cos(rad)
-      const hw = cw / 2, hh = ch / 2
-      const projs = [-hw * dx - hh * dy, hw * dx - hh * dy, -hw * dx + hh * dy, hw * dx + hh * dy]
-      const tMin = Math.min(...projs), tMax = Math.max(...projs)
-      const cx = cw / 2, cy = ch / 2
-      grad = c.createLinearGradient(cx + tMin * dx, cy + tMin * dy, cx + tMax * dx, cy + tMax * dy)
-    } else {
-      const gcx = cw * (g.cx ?? 0.5), gcy = ch * (g.cy ?? 0.5)
-      const r = Math.hypot(Math.max(gcx, cw - gcx), Math.max(gcy, ch - gcy))
-      grad = c.createRadialGradient(gcx, gcy, 0, gcx, gcy, r)
-    }
-    addStops(grad, g.stops)
-    c.fillStyle = grad
-    c.fillRect(0, 0, cw, ch)
+    fillGradient(c, resolveGradientBox(lin, wPt, hPt), cw, ch)
     return canvas
   }
 
   const conic = parseCSSConicGradient(spec)
-  if (conic && typeof c.createConicGradient === 'function') {
-    const grad = c.createConicGradient((conic.fromDeg - 90) * Math.PI / 180, conic.cx * cw, conic.cy * ch)
-    addStops(grad, tileStops(conic.stops, conic.repeating))
-    c.fillStyle = grad
-    c.fillRect(0, 0, cw, ch)
+  if (conic) {
+    fillConic(c, conic, cw, ch, wPt, hPt)
     return canvas
   }
 
@@ -76,7 +33,13 @@ async function paintMaskSource(spec: string, wPt: number, hPt: number, cw: numbe
   if (urlM) {
     const img = await loadImage(urlM[2]!)
     if (!img) return null
-    c.drawImage(img, 0, 0, cw, ch)
+    const prop = (name: string) => String((s as any)[name] || (s as any)[`webkit${name[0]!.toUpperCase()}${name.slice(1)}`] || '')
+    const { ax, ay } = tileAxes(prop('maskSize') || 'auto', prop('maskRepeat') || 'repeat', prop('maskPosition') || '0% 0%',
+      { x: 0, y: 0, w: wPt, h: hPt }, img.naturalWidth / PX_PER_PT, img.naturalHeight / PX_PER_PT)
+    const kx = cw / wPt, ky = ch / hPt
+    for (const tx of tilePositions(ax, 0, wPt)) {
+      for (const ty of tilePositions(ay, 0, hPt)) c.drawImage(img, tx * kx, ty * ky, ax.size * kx, ay.size * ky)
+    }
     return canvas
   }
 
@@ -100,13 +63,14 @@ export async function emitMaskedElement(el: Element, s: CSSStyleDeclaration, ctx
   const ch = Math.max(1, Math.round(domRect.height * dpr))
 
   const maskSpec   = (s as any).maskImage as string
-  const maskCanvas = await paintMaskSource(maskSpec, w, h, cw, ch)
+  const maskCanvas = await paintMaskSource(maskSpec, s, w, h, cw, ch)
   // an unresolvable source (e.g. a url() that fails to load) leaves the
   // element unrendered rather than guessing — matching how a failed
   // background-image degrades, not a hard error
   if (!maskCanvas) return
 
-  const content = document.createElement('canvas')
+  // from the element's own document: paintNode's ctx.font only sees fonts loaded there
+  const content = el.ownerDocument.createElement('canvas')
   content.width  = cw
   content.height = ch
   paintNode(el, content.getContext('2d')!, domRect, dpr)
@@ -124,6 +88,6 @@ export async function emitMaskedElement(el: Element, s: CSSStyleDeclaration, ctx
 
   const opacity = stackOpacity(ctx)
   for (const { page, y: ly } of paginateSpan(y, h, ctx.pageH)) {
-    ctx.commands.push({ type: 'image', page, src, format: 'png', x, y: ly, w, h, opacity } as ImageCommand)
+    ctx.commands.push({ type: 'image', page, src, format: 'png', x, y: ly, w, h, opacity, blend: stackBlend(ctx) } as ImageCommand)
   }
 }

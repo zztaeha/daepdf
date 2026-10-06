@@ -9,11 +9,13 @@ function grownCorner(c: Corner, by: number): Corner {
   return { h: Math.max(0, c.h + by), v: Math.max(0, c.v + by) }
 }
 
+// opacity and blend: the element's own, which apply to its shadows as to the rest of it
 export function emitShadows(
   doc: PdfDoc,
   shadows: BoxShadow[],
   x: number, y: number, w: number, h: number,
   rr: ResolvedRadius,
+  opacity = 1, blend?: string,
 ): void {
   const rounded = anyRadius(rr)
   for (const sh of shadows) {
@@ -32,7 +34,7 @@ export function emitShadows(
     // every blurred shadow in the codebase and there is no visual harness right
     // now to catch a regression, so only the no-falloff case is handled here.
     const layerAlpha = (i: number): number =>
-      (sh.color[3] ?? 255) / 255 * (steps === 1 ? 1 : (i / steps) * 0.4)
+      opacity * sh.color[3] / 255 * (steps === 1 ? 1 : (i / steps) * 0.4)
 
     if (sh.inset) {
       // Inset: clip to box interior so the shadow layers only appear inside the box
@@ -65,7 +67,7 @@ export function emitShadows(
         const alpha = layerAlpha(i)
         const band  = Math.max(0, (sh.blur / steps) * (steps - i + 1) * 0.5 + ext)
         if (!band) continue
-        doc.set_alpha(alpha)
+        doc.set_alpha(alpha, blend)
         doc.border_ring(sx, sy, w, h, rr.tl, rr.tr, rr.br, rr.bl, band)
       }
     } else {
@@ -79,13 +81,13 @@ export function emitShadows(
         const grow   = expand + ext
         const gw = w + grow * 2, gh = h + grow * 2
         if (gw <= 0 || gh <= 0) continue
-        doc.set_alpha(alpha)
+        doc.set_alpha(alpha, blend)
         if (rounded) {
           doc.rounded_rect(sx - grow, sy - grow, gw, gh,
             grownCorner(rr.tl, grow), grownCorner(rr.tr, grow),
-            grownCorner(rr.br, grow), grownCorner(rr.bl, grow), 'F')
+            grownCorner(rr.br, grow), grownCorner(rr.bl, grow))
         } else {
-          doc.rect(sx - grow, sy - grow, gw, gh, 'F')
+          doc.rect(sx - grow, sy - grow, gw, gh)
         }
       }
     }

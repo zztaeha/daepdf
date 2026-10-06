@@ -1,18 +1,19 @@
-import { applyToPDF, rasterizeSVGs } from '../pdf/index.js'
-import { resolvePageSize } from '../types/index.js'
-import type { PageConfig, DocDefinition, DrawCommand, TransformCommand, ClipCommand, AnchorEntry } from '../types/index.js'
+import { applyToPDF, rasterizeSVGs, PDFA_SECURITY_ERROR, PDFUA_TITLE_ERROR } from '../pdf/index.js'
+import initEngine from '../daegun/wasm/daegun.js'
+import { resolvePageSize, isStructNode } from '../types/index.js'
+import type { PageConfig, DocDefinition, DrawCommand, TransformCommand, ClipCommand, ArtifactCommand, AnchorEntry, StructNode } from '../types/index.js'
 import { PX_PER_PT, pruneStructTreePages, type FontBridgeMap, type HTMLCapture, type HTMLToPDFOptions, type WalkerCtx } from './types.js'
 import { buildRegisteredFontMap } from './fonts.js'
-import { walkChildren } from './walk.js'
+import { paintStackingContext, walkChildren } from './walk.js'
 import { emitBox } from './emit.js'
-import { parseSafeHTML, safeInjectParsed, createHiddenContainer, autoRegisterFonts, waitForLayout, injectWordBreaks, nextScopeId, extractFontFaceBlocks } from './prep.js'
+import { resolveBgImages } from './images.js'
+import { parseSafeHTML, safeInjectParsed, createHiddenContainer, autoRegisterFonts, injectWordBreaks, nextScopeId, extractFontFaceBlocks } from './prep.js'
+import { snapshotHost, applyHost, createPageFrame, waitForLayout, type HostSnapshot } from './frame.js'
 import { applyCounters } from './counters.js'
 import { applyPageBreaks, undoPageBreaks } from './breaks.js'
 import { measureChromeHeight, captureChrome, type PageChromeFn } from './chrome.js'
 
-export type { FontBridgeMap, HTMLCapture, HTMLToPDFOptions }
-export { invalidateFontMapCache } from './fonts.js'
-export { invalidateImageCache } from './images.js'
+export type { FontBridgeMap, HTMLToPDFOptions }
 
 export async function fromDOM(
   el:        HTMLElement,
@@ -21,7 +22,7 @@ export async function fromDOM(
   taggedPdf: boolean = false,
 ): Promise<HTMLCapture> {
   const size = resolvePageSize(config.size, config.orientation)
-  await waitForLayout()
+  await waitForLayout(el)
 
   // page-break pass mutates the DOM with marked spacers (browser print behavior:
   // no cut lines/rows) — always undone, since el may be the caller's live element
@@ -44,9 +45,11 @@ export async function fromDOM(
       blendStack:      [],
       counters:        new Map(),
       struct: taggedPdf
-        ? { root: structRoot, stack: [structRoot], mcidCounters: new Map(), artifactDepth: 0 }
+        ? { root: structRoot, stack: [structRoot], mcidCounters: new Map(), artifactDepth: 0, annotCount: 0 }
         : undefined,
       fieldCounter:    { n: 0 },
+      baselineOffsets: new Map(),
+      clampBoxes:      new Map(),
       fixedElements:   [],
     }
 
@@ -55,8 +58,8 @@ export async function fromDOM(
     // (same for a body-level counter-reset; nothing outlives the walk, no pop needed)
     const rootStyle = getComputedStyle(el)
     applyCounters(ctx.counters, rootStyle)
-    emitBox(el, rootStyle, ctx)
-    await walkChildren(el, rootStyle, ctx)
+    emitBox(el, rootStyle, ctx, await resolveBgImages(rootStyle))
+    await paintStackingContext(ctx, () => walkChildren(el, rootStyle, ctx))
 
     const totalHPx  = el.scrollHeight
     const rawPages  = totalHPx / (size.height * PX_PER_PT)
@@ -73,9 +76,9 @@ export async function fromDOM(
     // at whichever page it naturally fell on — replicated onto every OTHER real
     // page now that pageCount is known, matching CSS Paged Media's repeat-per-
     // page-box semantics. Scope limit, documented rather than silently wrong:
-    // mcid/structTag (D3 tagged PDF) is kept only on the natural-page instance —
-    // reusing the same mcid on a different page would collide with that page's
-    // own independent mcid counter, so replicated copies are struct-untagged.
+    // mcid/structTag/structAnnot (D3 tagged PDF) is kept only on the natural-page
+    // instance – reusing the same mcid on a different page would collide with that
+    // page's own independent mcid counter, so replicated copies are struct-untagged.
     for (const group of ctx.fixedElements ?? []) {
       if (!group.length) continue
       const naturalPage = Math.min(...group.map(c => c.page))
@@ -83,9 +86,10 @@ export async function fromDOM(
       for (let page = 1; page <= pageCount; page++) {
         for (const cmd of group) {
           if (page === naturalPage) { commands.push(cmd); continue }
-          const clone = { ...cmd, page } as typeof cmd & { mcid?: number; structTag?: string }
+          const clone = { ...cmd, page } as typeof cmd & { mcid?: number; structTag?: string; structAnnot?: number }
           delete clone.mcid
           delete clone.structTag
+          delete clone.structAnnot
           commands.push(clone)
         }
       }
@@ -109,50 +113,66 @@ export async function fromHTML(
   const scopeId   = nextScopeId()
   const parsed    = parseSafeHTML(html, scopeId)
   const styleText = Array.from(parsed.querySelectorAll('style'))
-    .map(s => s.textContent ?? '').join('\n')
+    .map(s => s.textContent).join('\n')
   await autoRegisterFonts(styleText)
   const trueSize  = resolvePageSize(config.size, config.orientation)
+  const host      = snapshotHost()
 
-  // header/footer reserve fixed top/bottom bands, independent of how many pages
-  // the content itself needs — measured once, before laying out content against
-  // the resulting shrunken page height
-  const headerH = chrome.header ? await measureChromeHeight(chrome.header, trueSize.width) : 0
-  const footerH = chrome.footer ? await measureChromeHeight(chrome.footer, trueSize.width) : 0
-  const contentConfig: PageConfig = (headerH || footerH)
-    ? { size: { width: trueSize.width, height: trueSize.height - headerH - footerH } }
-    : config
-  const contentHeight = resolvePageSize(contentConfig.size, contentConfig.orientation).height
-
-  const container = createHiddenContainer(trueSize.width, contentHeight)
-  let capture: HTMLCapture
+  // one frame serves every page's header and footer, not one per capture
+  const chromeFrame = chrome.header || chrome.footer
+    ? await createPageFrame(document.body, trueSize.width * PX_PER_PT, trueSize.height * PX_PER_PT, host)
+    : null
   try {
-    safeInjectParsed(parsed, container, scopeId)
-    // container is already attached (createHiddenContainer appends it to document.body),
-    // so getComputedStyle here correctly resolves stylesheet-cascaded white-space —
-    // unlike inside parseSafeHTML, which runs on a still-detached document
-    injectWordBreaks(container)
-    // scoped to the export container — a bare * selector would restyle the host
-    // page for the duration of the export
-    const opszStyle = document.createElement('style')
-    opszStyle.textContent = `[data-tpdf-scope="${scopeId}"] *{font-optical-sizing:none}`
-    container.appendChild(opszStyle)
-    capture = await fromDOM(container, contentConfig, fonts, taggedPdf)
-  } finally {
-    document.body.removeChild(container)
-  }
+    // header and footer bands are measured once, up front: the content is laid out
+    // against the page height they leave
+    const headerH = chrome.header ? await measureChromeHeight(chrome.header, trueSize.width, chromeFrame!.doc) : 0
+    const footerH = chrome.footer ? await measureChromeHeight(chrome.footer, trueSize.width, chromeFrame!.doc) : 0
+    const contentConfig: PageConfig = (headerH || footerH)
+      ? { size: { width: trueSize.width, height: trueSize.height - headerH - footerH } }
+      : config
+    const contentHeight = resolvePageSize(contentConfig.size, contentConfig.orientation).height
 
-  if (!headerH && !footerH) return capture
-  return applyChrome(capture, chrome, trueSize, headerH, footerH, fonts)
+    const frame = await createPageFrame(document.body, trueSize.width * PX_PER_PT, contentHeight * PX_PER_PT, host)
+    let capture: HTMLCapture
+    try {
+      const container = createHiddenContainer(frame.doc, trueSize.width, contentHeight)
+      safeInjectParsed(parsed, container, scopeId)
+      // after attaching: white-space set by stylesheets only resolves on an attached node
+      injectWordBreaks(container)
+      const opszStyle = frame.doc.createElement('style')
+      opszStyle.textContent = `[data-tpdf-scope="${scopeId}"] *{font-optical-sizing:none}`
+      container.appendChild(opszStyle)
+      capture = await fromDOM(container, contentConfig, fonts, taggedPdf)
+    } finally {
+      frame.frame.remove()
+    }
+
+    if (!headerH && !footerH) return capture
+    return await applyChrome(capture, chrome, trueSize, headerH, footerH, fonts, chromeFrame!.doc)
+  } finally {
+    chromeFrame?.frame.remove()
+  }
 }
 
-// Shifts the already-captured content down by headerH (reusing the exact
-// TransformCommand mechanism CSS transforms use — a pure translate, matrix
-// f=-headerH: see B1's buildPdfTransformMatrix for the same PDF-native cm
-// convention) and appends one header/footer capture per real page, each
-// wrapped in its own translate so its LOCAL (0,0)-origin content lands in
-// true page coordinates. Header needs no shift (its local origin already IS
-// the true page top); footer's f=-(trueHeight-footerH) places its local top
-// at the true bottom band's start.
+// The next free AnnotRef key: header/footer annotations are numbered after the content's
+function nextAnnotKey(root: StructNode): number {
+  let max = -1
+  const walk = (node: StructNode): void => {
+    for (const kid of node.kids) {
+      if (isStructNode(kid)) walk(kid)
+      else if ('annot' in kid) max = Math.max(max, kid.annot)
+    }
+  }
+  walk(root)
+  return max + 1
+}
+
+// Links and form fields are annotations outside the content stream, where the translate that
+// moves content into place under a header or into the footer band never reaches; they move by y.
+function shiftAnnotation(cmd: DrawCommand, dy: number): DrawCommand {
+  return dy && (cmd.type === 'link' || cmd.type === 'field') ? { ...cmd, y: cmd.y + dy } : cmd
+}
+
 async function applyChrome(
   capture:  HTMLCapture,
   chrome:   { header?: PageChromeFn | undefined; footer?: PageChromeFn | undefined },
@@ -160,10 +180,21 @@ async function applyChrome(
   headerH:  number,
   footerH:  number,
   fonts:    FontBridgeMap,
+  doc:      Document,
 ): Promise<HTMLCapture> {
   const pages = Array.from(new Set(capture.commands.map(c => c.page))).sort((a, b) => a - b)
   const out: DrawCommand[] = []
   const contentH = trueSize.height - headerH - footerH
+
+  // Tagged output: a header or footer is a pagination artifact, but its links and fields are
+  // annotations, which must sit in the structure tree, each in a Link or Form element of its own
+  const root = capture.structRoot
+  let annotKey = root ? nextAnnotKey(root) : 0
+  const tagAnnotation = (cmd: DrawCommand): DrawCommand => {
+    if (!root || (cmd.type !== 'link' && cmd.type !== 'field')) return cmd
+    root.kids.push({ tag: cmd.type === 'link' ? 'Link' : 'Form', kids: [{ annot: annotKey, page: cmd.page }] })
+    return { ...cmd, structAnnot: annotKey++ }
+  }
 
   for (const page of pages) {
     if (headerH) out.push({ type: 'transform-push', page, matrix: [1, 0, 0, 1, 0, -headerH] } satisfies TransformCommand)
@@ -179,7 +210,7 @@ async function applyChrome(
     // multi-page invoice render — a table's column border lines bled through
     // the footer — not by any operator-level test.
     out.push({ type: 'clip-push', page, x: 0, y: 0, w: trueSize.width, h: contentH } satisfies ClipCommand)
-    for (const cmd of capture.commands) if (cmd.page === page) out.push(cmd)
+    for (const cmd of capture.commands) if (cmd.page === page) out.push(shiftAnnotation(cmd, headerH))
     out.push({ type: 'clip-pop', page } satisfies ClipCommand)
     if (headerH) out.push({ type: 'transform-pop', page } satisfies TransformCommand)
   }
@@ -189,20 +220,24 @@ async function applyChrome(
     // reserved band at all — skip its own capture too, since ctx.pageH=0 would
     // divide-by-zero inside the walker's own pagination math
     if (chrome.header && headerH > 0) {
-      const cmds = await captureChrome(chrome.header, page, capture.pageCount, trueSize.width, headerH, fonts)
+      const cmds = await captureChrome(chrome.header, page, capture.pageCount, trueSize.width, headerH, fonts, doc)
       // clips to the reserved band — the header's own natural height was measured
       // from a single representative render (page=1, totalPages=1); a real page's
       // digit count ("Page 10 of 250" vs "Page 1 of 1") can wrap a shade taller, and
       // this keeps that from bleeding into the content directly below it
       out.push({ type: 'clip-push', page, x: 0, y: 0, w: trueSize.width, h: headerH } satisfies ClipCommand)
-      for (const c of cmds) { c.page = page; out.push(c) }
+      out.push({ type: 'artifact-push', page, subtype: 'Header' } satisfies ArtifactCommand)
+      for (const c of cmds) { c.page = page; out.push(tagAnnotation(c)) }
+      out.push({ type: 'artifact-pop', page } satisfies ArtifactCommand)
       out.push({ type: 'clip-pop', page } satisfies ClipCommand)
     }
     if (chrome.footer && footerH > 0) {
-      const cmds = await captureChrome(chrome.footer, page, capture.pageCount, trueSize.width, footerH, fonts)
+      const cmds = await captureChrome(chrome.footer, page, capture.pageCount, trueSize.width, footerH, fonts, doc)
       out.push({ type: 'transform-push', page, matrix: [1, 0, 0, 1, 0, -(trueSize.height - footerH)] } satisfies TransformCommand)
       out.push({ type: 'clip-push', page, x: 0, y: 0, w: trueSize.width, h: footerH } satisfies ClipCommand)
-      for (const c of cmds) { c.page = page; out.push(c) }
+      out.push({ type: 'artifact-push', page, subtype: 'Footer' } satisfies ArtifactCommand)
+      for (const c of cmds) { c.page = page; out.push(tagAnnotation(shiftAnnotation(c, trueSize.height - footerH))) }
+      out.push({ type: 'artifact-pop', page } satisfies ArtifactCommand)
       out.push({ type: 'clip-pop', page } satisfies ClipCommand)
       out.push({ type: 'transform-pop', page } satisfies TransformCommand)
     }
@@ -219,106 +254,146 @@ async function applyChrome(
   return { commands: out, pageCount: capture.pageCount, anchors, structRoot: capture.structRoot }
 }
 
-// previewHTML strips @font-face from each call's own injected content (see
-// below) so the browser doesn't re-trigger a font fetch on every re-render —
-// but the SAME rule still needs to reach the browser's real font set once,
-// or the preview falls back to a system font with no @font-face anywhere to
-// load it from. Injected once per unique rule text into a persistent,
-// cross-call <style> in the real document head (not the per-call container),
-// so a caller never has to also declare the font in their own global CSS.
-const _injectedPreviewFonts = new Set<string>()
-let _previewFontStyleEl: HTMLStyleElement | null = null
+const PAGE_GAP_PX = 24
+// matches the export's own opsz rule; kept with the fonts so it survives re-renders
+const PREVIEW_FRAME_CSS = '[data-tpdf-scope] *{font-optical-sizing:none}\n'
 
-function ensurePreviewFontStyleEl(): HTMLStyleElement {
-  if (!_previewFontStyleEl || !_previewFontStyleEl.isConnected) {
-    _previewFontStyleEl = document.createElement('style')
-    _previewFontStyleEl.dataset['tpdfPreviewFonts'] = ''
-    document.head.appendChild(_previewFontStyleEl)
-  }
-  return _previewFontStyleEl
-}
+interface PreviewQueue { latest: number; chain: Promise<void> }
+const previewQueues = new WeakMap<HTMLElement, PreviewQueue>()
 
+// One render at a time per container, and only the newest waiting call runs. Resolves when
+// this call's pages are on screen, or as soon as a newer call has replaced it.
 export function previewHTML(
   html:      string,
   container: HTMLElement,
   config:    PageConfig,
-): void {
-  container.dataset['tpdfPreview'] = ''
+): Promise<void> {
+  const queue = previewQueues.get(container) ?? { latest: 0, chain: Promise.resolve() }
+  previewQueues.set(container, queue)
+  const token = ++queue.latest
+  const run = queue.chain.then(() => token === queue.latest ? renderPreview(html, container, config) : undefined)
+  queue.chain = run.catch(() => undefined)
+  return run
+}
 
-  // opsz-disable rule must persist across re-renders — inject once and leave it
-  if (!container.querySelector('[data-tpdf-opsz]')) {
-    const opszEl = document.createElement('style')
-    opszEl.dataset['tpdfOpsz'] = ''
-    opszEl.textContent = '[data-tpdf-preview] *,[data-tpdf-measure] *{font-optical-sizing:none}'
-    container.appendChild(opszEl)
+// a frame reloads (and loses its setup) whenever it is moved in the DOM; mid-reload its
+// document can be half parsed, with no head yet
+function frameDoc(frame: HTMLIFrameElement | null | undefined): Document | null {
+  const doc = frame?.contentDocument
+  return doc?.head?.querySelector('[data-tpdf-base]') ? doc : null
+}
+
+function addPreviewStyle(doc: Document): void {
+  const style = doc.createElement('style')
+  style.dataset['tpdfFonts'] = ''
+  style.textContent = PREVIEW_FRAME_CSS
+  doc.head.appendChild(style)
+}
+
+// Brings a frame up to date: page size, host CSS, and any @font-face it lacks. Fonts
+// live in the frame head, once each, so re-renders never refetch them.
+async function prepareFrame(frame: HTMLIFrameElement, wPx: number, hPx: number, host: HostSnapshot, fontBlocks: string[]): Promise<void> {
+  const doc = frame.contentDocument!
+  frame.style.width  = `${wPx}px`
+  frame.style.height = `${hPx}px`
+  await applyHost(doc, host)
+  const fontsEl = doc.head.querySelector('[data-tpdf-fonts]')!
+  for (const block of fontBlocks) {
+    if (!fontsEl.textContent.includes(block)) fontsEl.appendChild(doc.createTextNode(block + '\n'))
   }
+}
+
+// Measuring uses a hidden frame in the host body, not a page card: WebKit scales layout
+// inside a frame under a zoomed ancestor, and the README recommends zooming the preview.
+const measureFrames = new Map<HTMLElement, HTMLIFrameElement>()
+
+async function measureFrameFor(container: HTMLElement, wPx: number, hPx: number, host: HostSnapshot): Promise<HTMLIFrameElement> {
+  for (const [owner, frame] of measureFrames) {
+    if (!owner.isConnected) { frame.remove(); measureFrames.delete(owner) }
+  }
+  const existing = measureFrames.get(container)
+  if (frameDoc(existing)) return existing!
+  existing?.remove()
+  const { frame, doc } = await createPageFrame(document.body, wPx, hPx, host)
+  addPreviewStyle(doc)
+  measureFrames.set(container, frame)
+  return frame
+}
+
+// created hidden; the swap reveals it once it has content
+async function addPageCard(container: HTMLElement, wPx: number, hPx: number, host: HostSnapshot): Promise<HTMLDivElement> {
+  const card = document.createElement('div')
+  card.dataset['tpdfPage'] = ''
+  card.style.cssText = `position:relative;width:${wPx}px;height:${hPx}px;overflow:hidden;flex-shrink:0;background:white;box-shadow:0 2px 8px rgba(0,0,0,0.15);display:none;`
+  container.appendChild(card)
+  addPreviewStyle((await createPageFrame(card, wPx, hPx, host, true)).doc)
+  return card
+}
+
+async function renderPreview(html: string, container: HTMLElement, config: PageConfig): Promise<void> {
+  container.dataset['tpdfPreview'] = ''
 
   const size    = resolvePageSize(config.size, config.orientation)
   const pageWPx = size.width  * PX_PER_PT
   const pageHPx = size.height * PX_PER_PT
+  const host    = snapshotHost()
 
-  // unique per call — see nextScopeId's own comment: a live preview's content stays
-  // attached in the DOM until the NEXT preview call replaces it, which can overlap
-  // with a render() call made in between (e.g. exporting a PDF while the preview is
-  // still showing); a shared/constant scope marker let those two @scope blocks
-  // cross-apply to each other for any property one didn't redeclare
   const scopeId = nextScopeId()
   const parsed  = parseSafeHTML(html, scopeId)
 
-  // @font-face blocks are stripped from the per-call content so the browser doesn't
-  // re-trigger a font fetch on every preview render — any block not already injected
-  // into the persistent head style gets added there first, so the font still loads
-  // globally without the caller declaring it a second time anywhere
+  const fontBlocks: string[] = []
   for (const el of Array.from(parsed.querySelectorAll('style'))) {
-    const css = el.textContent ?? ''
-    const blocks = extractFontFaceBlocks(css)
-    let stripped = css
-    for (const block of blocks) {
-      if (!_injectedPreviewFonts.has(block)) {
-        _injectedPreviewFonts.add(block)
-        ensurePreviewFontStyleEl().appendChild(document.createTextNode(block + '\n'))
-      }
-      stripped = stripped.replace(block, '')
+    let css = el.textContent
+    for (const block of extractFontFaceBlocks(css)) {
+      fontBlocks.push(block)
+      css = css.replace(block, '')
     }
-    el.textContent = stripped
+    el.textContent = css
   }
 
-  // measure off-screen so the container keeps its current content — no flash between
-  // renders. Word breaks AND page-break spacers are applied here, then each page div
-  // receives a CLONE of the measured DOM: preview pages carry the exact same spacers
-  // the PDF capture will produce, so preview == PDF page-for-page.
-  const measure = document.createElement('div')
-  measure.dataset['tpdfMeasure'] = ''
-  // transform:translateZ(0) establishes a containing block for position:fixed
-  // descendants (see createHiddenContainer's own comment in prep.ts) — without
-  // it, a user's position:fixed element resolves against the real viewport
-  // instead of this off-screen div while it's briefly attached to measure.
-  measure.style.cssText = `position:fixed;top:-99999px;left:-99999px;width:${pageWPx}px;height:auto;visibility:hidden;transform:translateZ(0);`
+  // Measured with word breaks and page-break spacers applied, then cloned into each page,
+  // so the preview carries the same spacers as the PDF and matches it page for page
+  const measureFrame = await measureFrameFor(container, pageWPx, pageHPx, host)
+  await prepareFrame(measureFrame, pageWPx, pageHPx, host, fontBlocks)
+  const doc     = frameDoc(measureFrame)!
+  const measure = doc.createElement('div')
+  measure.style.cssText = `position:absolute;top:0;left:0;width:${pageWPx}px;height:auto;transform:translateZ(0);`
   safeInjectParsed(parsed, measure, scopeId)
-  document.body.appendChild(measure)
-  injectWordBreaks(measure)
-  applyPageBreaks(measure, pageHPx)
-  const totalHPx = measure.scrollHeight
-  const measured = Array.from(measure.childNodes).map(n => n.cloneNode(true))
-  document.body.removeChild(measure)
+  doc.body.appendChild(measure)
+  let totalHPx: number
+  let measured: Node[]
+  try {
+    await waitForLayout(measure)
+    injectWordBreaks(measure)
+    applyPageBreaks(measure, pageHPx)
+    totalHPx = measure.scrollHeight
+    measured = Array.from(measure.childNodes).map(n => n.cloneNode(true))
+  } finally {
+    measure.remove()
+  }
 
   // fractional overshoot < 1% of page height is sub-pixel rounding, not real overflow
   const rawPages  = totalHPx / pageHPx
   const frac      = rawPages - Math.floor(rawPages)
   const pageCount = Math.max(1, frac < 0.01 ? Math.floor(rawPages) : Math.ceil(rawPages))
 
-  const frag = document.createDocumentFragment()
-  for (let p = 0; p < pageCount; p++) {
-    const page = document.createElement('div')
-    // transform:translateZ(0) establishes a containing block for position:fixed
-    // descendants — this page div is a real, visible, in-document element (unlike
-    // measure above), so without it, a user's position:fixed content would escape
-    // to the actual browser viewport and land on the host page, not just fail to
-    // repeat per page.
-    page.style.cssText = `position:relative;width:${pageWPx}px;height:${pageHPx}px;overflow:hidden;flex-shrink:0;background:white;box-shadow:0 2px 8px rgba(0,0,0,0.15);transform:translateZ(0);`
-    if (p < pageCount - 1) page.style.marginBottom = '24px'
+  const cards: HTMLDivElement[] = []
+  for (const card of Array.from(container.querySelectorAll<HTMLDivElement>(':scope > [data-tpdf-page]'))) {
+    if (frameDoc(card.querySelector('iframe'))) cards.push(card)
+    else card.remove()
+  }
+  while (cards.length < pageCount) cards.push(await addPageCard(container, pageWPx, pageHPx, host))
+  for (const card of cards.slice(0, pageCount)) {
+    card.style.width  = `${pageWPx}px`
+    card.style.height = `${pageHPx}px`
+    await prepareFrame(card.querySelector('iframe')!, pageWPx, pageHPx, host, fontBlocks)
+  }
 
-    const inner = document.createElement('div')
+  // Atomic swap: every page fills in the same task, so nothing flashes between renders
+  const active = new Set<Element>(cards.slice(0, pageCount))
+  cards.slice(0, pageCount).forEach((card, p) => {
+    const pageDocument = frameDoc(card.querySelector('iframe'))!
+    const inner = pageDocument.createElement('div')
     // scope root for the @scope CSS wrapper (normally set by safeInjectParsed) — must
     // be the SAME scopeId the measured content's <style> tags were scoped with
     inner.dataset['tpdfScope'] = scopeId
@@ -327,16 +402,25 @@ export function previewHTML(
     // positioned div and shift every preview boundary by that amount (the PDF
     // capture container's own margin never moves content within containerRect)
     inner.style.cssText = `position:absolute;top:${-(p * pageHPx)}px;left:0;width:100%;margin:0;`
-    for (const node of measured) inner.appendChild(node.cloneNode(true))
-    page.appendChild(inner)
-    frag.appendChild(page)
-  }
-
-  // Atomic swap: remove old page divs (keep the opsz style element), add new pages
+    for (const node of measured) inner.appendChild(pageDocument.importNode(node, true))
+    pageDocument.body.replaceChildren(inner)
+    card.style.display = ''
+    card.style.marginBottom = p < pageCount - 1 ? `${PAGE_GAP_PX}px` : ''
+  })
   for (const child of Array.from(container.children)) {
-    if (child.tagName !== 'STYLE') container.removeChild(child)
+    if (!active.has(child) && child.tagName !== 'STYLE') child.remove()
   }
-  container.appendChild(frag)
+}
+
+// PDF/UA wants alternative text on every figure; that is the template's markup to fix
+function warnFiguresWithoutAlt(root: StructNode): void {
+  let missing = 0
+  const walk = (node: StructNode): void => {
+    if (node.tag === 'Figure' && !node.alt) missing++
+    for (const kid of node.kids) if (isStructNode(kid)) walk(kid)
+  }
+  walk(root)
+  if (missing) console.warn(`[daepdf] PDF/UA: ${missing} image(s) have no alternative text – add alt (or alt="" for decoration), aria-label, or an SVG <title>.`)
 }
 
 export async function renderHTMLtoPDF(
@@ -348,22 +432,25 @@ export async function renderHTMLtoPDF(
   // PDF/A disallows encryption outright — a caller finds out immediately
   // rather than silently getting a non-conformant (or unencrypted) file
   if (options.pdfA && options.security) {
-    throw new Error('[daepdf] PDF/A does not allow encryption — pass either `pdfA` or `security`, not both.')
+    throw new Error(PDFA_SECURITY_ERROR)
   }
-  const taggedPdf = !!(options.taggedPdf || options.pdfA)
-  const { commands, anchors, structRoot } = await fromHTML(
+  if (options.pdfUA && !options.metadata?.title) throw new Error(PDFUA_TITLE_ERROR)
+  await initEngine()
+  const taggedPdf = !!(options.taggedPdf || options.pdfA || options.pdfUA)
+  const { commands, anchors, structRoot, pageCount } = await fromHTML(
     html, config, fonts, { header: options.header, footer: options.footer }, taggedPdf,
   )
   await rasterizeSVGs(commands)
+  if (options.pdfUA && structRoot) warnFiguresWithoutAlt(structRoot)
 
   const shim: DocDefinition = {
     config,
     metadata:  options.metadata,
     security:  options.security,
     bookmarks: options.bookmarks,
-    taggedPdf,
     pdfA:      !!options.pdfA,
+    pdfUA:     !!options.pdfUA,
   }
 
-  return applyToPDF(commands, shim, anchors, structRoot)
+  return applyToPDF(commands, shim, anchors, structRoot, pageCount)
 }
