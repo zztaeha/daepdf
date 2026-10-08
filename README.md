@@ -1,8 +1,10 @@
 # daepdf
 
-A browser-based HTML-to-PDF engine powered by Rust and WebAssembly. You design your document as HTML and CSS, daepdf captures the exact layout your browser renders, and turns it into a PDF – pixel for pixel.
+A browser-based HTML-to-PDF engine powered by Rust and WebAssembly. You design your document as HTML and CSS, daepdf captures the exact layout your browser renders, and rebuilds it as a real PDF that matches pixel for pixel – not a screenshot of the page. Text stays selectable, searchable and copyable in subsetted embedded fonts, SVGs become vector paths, and JPEGs are embedded without re-encoding.
 
 No server. No headless browser. No layout approximation. What the browser shows is what the PDF contains.
+
+Text is only rasterized inside an element that uses CSS `filter` or `mask-image`, and an SVG becomes an image only when it uses a feature with no vector equivalent. See [Filters and masks](#filters-and-masks) and [SVG and vector graphics](#svg-and-vector-graphics).
 
 ---
 
@@ -69,7 +71,7 @@ When you call `pdf.download()`, daepdf:
 
 1. Lays your HTML out in a hidden frame exactly one page in size, with your app's stylesheets copied in
 2. Reads every element's exact position, size, color, font, and style directly from the browser DOM using `getBoundingClientRect()` and `getComputedStyle()`
-3. Rebuilds that layout as a real PDF file, with a Rust/WASM engine shaping the text and embedding only the glyphs it uses
+3. Rebuilds that layout as a real PDF file with selectable text, using a Rust/WASM engine to shape the text and embed only the glyphs it uses
 4. Triggers a file download in the browser
 
 Because it reads from the live DOM, the output is exact. There is no font metric estimation, no layout engine to re-implement, and no gap between what you see and what you get.
