@@ -67,8 +67,8 @@ Things that count as a security issue here:
 ## Out of scope
 
 - Issues that only reproduce with a template author's own unescaped interpolation
-  of user input (see the README's
-  [Escaping HTML](https://github.com/zztaeha/daepdf#escaping-html) section) –
+  of user input (see
+  [Escaping HTML](https://zztaeha.dev/daepdf/#escaping-html) in the docs) –
   that's the caller's responsibility, not daepdf's.
 - **PDF permission flags being ignored by a viewer.** Permissions (print, copy,
   modify) are bound into the encryption, but nothing forces a reader to honor
